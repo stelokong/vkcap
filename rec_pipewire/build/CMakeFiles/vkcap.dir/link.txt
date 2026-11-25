@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -flto=auto -fno-fat-lto-objects -Wl,--dependency-file=CMakeFiles/vkcap.dir/link.d CMakeFiles/vkcap.dir/src/main.cpp.o -o vkcap  libvkcap_core.a /usr/lib/libvulkan.so /usr/lib/libpipewire-0.3.so /usr/lib/libdrm.so /usr/lib/libgio-2.0.so /usr/lib/libgobject-2.0.so /usr/lib/libglib-2.0.so /usr/lib/libavformat.so /usr/lib/libavcodec.so /usr/lib/libavutil.so

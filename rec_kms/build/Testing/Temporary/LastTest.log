@@ -1,0 +1,29 @@
+Start testing: Nov 25 18:48 EET
+----------------------------------------------------------
+1/1 Testing: vkcap_kms_tests
+1/1 Test: vkcap_kms_tests
+Command: "/home/strawberry/Projects/AG Vulkan Video Screen Capture/rec_kms/build/vkcap_kms_tests"
+Directory: /home/strawberry/Projects/AG Vulkan Video Screen Capture/rec_kms/build
+"vkcap_kms_tests" start time: Nov 25 18:48 EET
+Output:
+----------------------------------------------------------
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+[mp4 @ 0x55a9e07ce4c0] Starting second pass: moving the moov atom to the beginning of the file
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+[PASS] test_cli_and_privileges (found 3 KMS displays, 7 profiles)
+[PASS] kms_nv12_1920x1080->1920x1080_hwcur (mp4): 60 frames in 0.155s (387.8 fps, compute 0.146 ms/f)
+[PASS] kms_p010_1920x1080->1920x1080_hwcur (mkv): 60 frames in 0.172s (348.6 fps, compute 0.098 ms/f)
+[PASS] kms_nv12_3840x2160->2560x1440_hwcur (webm): 60 frames in 0.266s (225.6 fps, compute 0.250 ms/f)
+[PASS] kms_nv12_3840x2160->3840x2160_nocur (mkv): 180 frames in 1.712s (105.1 fps, compute 0.158 ms/f)
+All KMS unit and GPU integration tests passed.
+<end of output>
+Test time =   3.62 sec
+----------------------------------------------------------
+Test Passed.
+"vkcap_kms_tests" end time: Nov 25 18:48 EET
+"vkcap_kms_tests" time elapsed: 00:00:03
+----------------------------------------------------------
+
+End testing: Nov 25 18:48 EET

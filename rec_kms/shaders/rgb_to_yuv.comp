@@ -1,0 +1,273 @@
+#version 460
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+
+// Ultra-fast, high-quality RGB -> NV12 / P010 compute shader with optional
+// zero-copy KMS hardware cursor plane compositing.
+// Compiled twice at build time: -DP010=0 (r8/rg8) and -DP010=1 (r16/rg16).
+// Specialized at pipeline creation via SPIR-V specialization constants so dead
+// branches (scaling, cursor, dither) are completely eliminated from RDNA 4 ISA.
+
+#ifndef P010
+#define P010 0
+#endif
+
+// 16x4 = 64 threads (2 Wave32 or 1 Wave64), covering a 32x8 pixel tile per workgroup:
+// - 32-byte coalesced R8 Y stores and 32-byte coalesced RG8 UV stores
+// - 15 of 16 lanes reuse neighbor's right texels via 1-cycle subgroupShuffleUp
+//   (33% fewer texture fetches in 1:1 mode!)
+layout(local_size_x = 16, local_size_y = 4, local_size_z = 1) in;
+
+layout(constant_id = 0) const bool kExact1To1 = true;
+layout(constant_id = 1) const bool kHasCursor = false;
+layout(constant_id = 2) const bool kEnableDither = true;
+layout(constant_id = 3) const bool kConvertGamut = false;
+// Row-major 3x3 linear RGB->RGB gamut matrix (constant-folded into ISA when kConvertGamut=true)
+layout(constant_id = 4)  const float kGm00 = 1.0;
+layout(constant_id = 5)  const float kGm01 = 0.0;
+layout(constant_id = 6)  const float kGm02 = 0.0;
+layout(constant_id = 7)  const float kGm10 = 0.0;
+layout(constant_id = 8)  const float kGm11 = 1.0;
+layout(constant_id = 9)  const float kGm12 = 0.0;
+layout(constant_id = 10) const float kGm20 = 0.0;
+layout(constant_id = 11) const float kGm21 = 0.0;
+layout(constant_id = 12) const float kGm22 = 1.0;
+
+layout(set = 0, binding = 0) uniform sampler2D uSrc;
+layout(set = 0, binding = 1) uniform sampler2D uCursor;
+#if P010
+layout(set = 0, binding = 2, r16) uniform writeonly image2D uDstY;
+layout(set = 0, binding = 3, rg16) uniform writeonly image2D uDstUV;
+#else
+layout(set = 0, binding = 2, r8) uniform writeonly image2D uDstY;
+layout(set = 0, binding = 3, rg8) uniform writeonly image2D uDstUV;
+#endif
+
+layout(push_constant) uniform PushConstants {
+    vec4 yCoeffs;       // xyz = scaled luma weights, w = luma offset
+    vec4 cbCoeffs;      // xyz = scaled Cb weights,   w = chroma offset
+    vec4 crCoeffs;      // xyz = scaled Cr weights,   w = chroma offset
+    vec4 cursorRect;    // xy = cursor top-left in source pixels, zw = cursor size
+    vec2 invCursorSize; // 1.0 / cursor size (precomputed on CPU)
+    vec2 srcOffset;     // Crop origin in source pixels
+    vec2 srcStepPx;     // cropExtent / dstExtent in source pixels
+    vec2 srcBasePx;     // srcOffset + 0.5 * srcStepPx in source pixels
+    vec2 invSrcSize;    // 1.0 / srcSize
+    uvec2 dstExtent;    // Output video width, height (guaranteed even)
+} pc;
+
+// 5-tap Catmull-Rom bicubic sampling in source-pixel coordinates (zero divisions!)
+vec3 sampleCatmullRom(vec2 srcPx) {
+    vec2 texPos = srcPx - 0.5;
+    vec2 f = fract(texPos);
+    vec2 basePos = texPos - f;
+
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+
+    vec2 w12 = w1 + w2;
+    vec2 off12 = w2 / max(w12, vec2(1e-5));
+
+    vec2 tc0  = (basePos - 0.5) * pc.invSrcSize;
+    vec2 tc12 = (basePos + 0.5 + off12) * pc.invSrcSize;
+    vec2 tc3  = (basePos + 2.5) * pc.invSrcSize;
+
+    vec3 c = vec3(0.0);
+    c += textureLod(uSrc, vec2(tc12.x, tc0.y),  0.0).rgb * (w12.x * w0.y);
+    c += textureLod(uSrc, vec2(tc0.x,  tc12.y), 0.0).rgb * (w0.x  * w12.y);
+    c += textureLod(uSrc, vec2(tc12.x, tc12.y), 0.0).rgb * (w12.x * w12.y);
+    c += textureLod(uSrc, vec2(tc3.x,  tc12.y), 0.0).rgb * (w3.x  * w12.y);
+    c += textureLod(uSrc, vec2(tc12.x, tc3.y),  0.0).rgb * (w12.x * w3.y);
+
+    float wSum = w12.x * (w0.y + w12.y + w3.y) + (w0.x + w3.x) * w12.y;
+    return clamp(c / max(wSum, 1e-5), 0.0, 1.0);
+}
+
+vec3 blendCursor(vec3 baseRgb, vec2 srcPx) {
+    vec2 rel = srcPx - pc.cursorRect.xy;
+    if (rel.x < 0.0 || rel.y < 0.0 || rel.x >= pc.cursorRect.z || rel.y >= pc.cursorRect.w) {
+        return baseRgb;
+    }
+    vec2 cuv = (rel + 0.5) * pc.invCursorSize;
+    vec4 cur = textureLod(uCursor, cuv, 0.0);
+    // DRM hardware cursor planes use premultiplied ARGB8888 alpha
+    return clamp(cur.rgb + baseRgb * (1.0 - cur.a), 0.0, 1.0);
+}
+
+// Piecewise sRGB EOTF -> 3x3 linear gamut matrix -> piecewise sRGB OETF.
+// Completely dead-code eliminated when kConvertGamut == false.
+vec3 srgbToLinear(vec3 c) {
+    vec3 lo = c * (1.0 / 12.92);
+    vec3 hi = pow(max((c + 0.055) * (1.0 / 1.055), vec3(0.0)), vec3(2.4));
+    return mix(lo, hi, greaterThan(c, vec3(0.04045)));
+}
+
+vec3 linearToSrgb(vec3 c) {
+    vec3 lo = c * 12.92;
+    vec3 hi = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(lo, hi, greaterThan(c, vec3(0.0031308)));
+}
+
+vec3 convertGamut(vec3 srgb) {
+    vec3 lin = srgbToLinear(srgb);
+    vec3 dst = vec3(
+        kGm00 * lin.r + kGm01 * lin.g + kGm02 * lin.b,
+        kGm10 * lin.r + kGm11 * lin.g + kGm12 * lin.b,
+        kGm20 * lin.r + kGm21 * lin.g + kGm22 * lin.b
+    );
+    return linearToSrgb(clamp(dst, 0.0, 1.0));
+}
+
+#if !P010
+// Single-hash static spatial Interleaved Gradient Noise -> triangular PDF in [-0.5, +0.5] LSB
+const vec2 kIgnVec = vec2(0.06711056, 0.00583715);
+
+float ignTriangular(vec2 p) {
+    float n = fract(52.9829189 * fract(dot(p, kIgnVec)));
+    float t = n * 2.0 - 1.0;
+    float tri = sign(t) * (1.0 - sqrt(max(1.0 - abs(t), 0.0)));
+    return tri * (0.5 / 255.0);
+}
+
+vec4 ignTriangular2x2(vec2 basePx) {
+    float d00 = dot(basePx, kIgnVec);
+    vec4 d = d00 + vec4(0.0, kIgnVec.x, kIgnVec.y, kIgnVec.x + kIgnVec.y);
+    vec4 n = fract(52.9829189 * fract(d));
+    vec4 t = n * 2.0 - 1.0;
+    vec4 tri = sign(t) * (1.0 - sqrt(max(1.0 - abs(t), vec4(0.0))));
+    return tri * (0.5 / 255.0);
+}
+#endif
+
+void main() {
+    uvec2 uvCoord = gl_GlobalInvocationID.xy;
+    uvec2 base = uvCoord * 2u;
+    const bool inBounds = (base.x < pc.dstExtent.x) && (base.y < pc.dstExtent.y);
+
+    ivec2 c00 = ivec2(min(base, pc.dstExtent - 2u));
+    ivec2 c10 = ivec2(c00.x + 1, c00.y);
+    ivec2 c01 = ivec2(c00.x, c00.y + 1);
+    ivec2 c11 = ivec2(c00.x + 1, c00.y + 1);
+
+    vec3 rgb00, rgb10, rgb01, rgb11;
+    vec3 chromaRgb;
+
+    if (kExact1To1) {
+        ivec2 off = ivec2(pc.srcOffset);
+        rgb00 = texelFetch(uSrc, off + c00, 0).rgb;
+        rgb10 = texelFetch(uSrc, off + c10, 0).rgb;
+        rgb01 = texelFetch(uSrc, off + c01, 0).rgb;
+        rgb11 = texelFetch(uSrc, off + c11, 0).rgb;
+
+        if (kHasCursor) {
+            vec2 p00 = vec2(off + c00);
+            if (p00.x + 2.0 >= pc.cursorRect.x && p00.x <= pc.cursorRect.x + pc.cursorRect.z &&
+                p00.y + 2.0 >= pc.cursorRect.y && p00.y <= pc.cursorRect.y + pc.cursorRect.w) {
+                rgb00 = blendCursor(rgb00, p00);
+                rgb10 = blendCursor(rgb10, p00 + vec2(1.0, 0.0));
+                rgb01 = blendCursor(rgb01, p00 + vec2(0.0, 1.0));
+                rgb11 = blendCursor(rgb11, p00 + vec2(1.0, 1.0));
+            }
+        }
+
+        if (kConvertGamut) {
+            rgb00 = convertGamut(rgb00);
+            rgb10 = convertGamut(rgb10);
+            rgb01 = convertGamut(rgb01);
+            rgb11 = convertGamut(rgb11);
+        }
+
+        // Uniform subgroup shuffle: lane x (1..15) gets left neighbor's (x-1) right pixels
+        // directly from VGPRs (zero extra texture fetches, already cursor-blended & gamut-converted!).
+        vec3 shufL0 = subgroupShuffleUp(rgb10, 1u);
+        vec3 shufL1 = subgroupShuffleUp(rgb11, 1u);
+
+        vec3 rgbL0, rgbL1;
+        if (gl_LocalInvocationID.x == 0u) {
+            int lx = max(off.x + c00.x - 1, off.x);
+            rgbL0 = texelFetch(uSrc, ivec2(lx, off.y + c00.y), 0).rgb;
+            rgbL1 = texelFetch(uSrc, ivec2(lx, off.y + c01.y), 0).rgb;
+            if (kHasCursor) {
+                vec2 pL = vec2(float(lx), float(off.y + c00.y));
+                if (pL.x + 1.0 >= pc.cursorRect.x && pL.x <= pc.cursorRect.x + pc.cursorRect.z &&
+                    pL.y + 2.0 >= pc.cursorRect.y && pL.y <= pc.cursorRect.y + pc.cursorRect.w) {
+                    rgbL0 = blendCursor(rgbL0, pL);
+                    rgbL1 = blendCursor(rgbL1, pL + vec2(0.0, 1.0));
+                }
+            }
+            if (kConvertGamut) {
+                rgbL0 = convertGamut(rgbL0);
+                rgbL1 = convertGamut(rgbL1);
+            }
+        } else {
+            rgbL0 = shufL0;
+            rgbL1 = shufL1;
+        }
+
+        if (!inBounds) {
+            return;
+        }
+
+        // MPEG-2 / AVCHROMA_LOC_LEFT 3x2 anti-aliased chroma filter:
+        // horizontal [1, 2, 1]/4 centered on left column, vertical [1, 1]/2
+        chromaRgb = 0.125 * (rgbL0 + rgbL1 + rgb10 + rgb11) + 0.25 * (rgb00 + rgb01);
+    } else {
+        if (!inBounds) {
+            return;
+        }
+        vec2 px00 = pc.srcBasePx + vec2(c00) * pc.srcStepPx;
+        vec2 px10 = vec2(px00.x + pc.srcStepPx.x, px00.y);
+        vec2 px01 = vec2(px00.x, px00.y + pc.srcStepPx.y);
+        vec2 px11 = px00 + pc.srcStepPx;
+        rgb00 = sampleCatmullRom(px00);
+        rgb10 = sampleCatmullRom(px10);
+        rgb01 = sampleCatmullRom(px01);
+        rgb11 = sampleCatmullRom(px11);
+        if (kHasCursor) {
+            rgb00 = blendCursor(rgb00, px00 - 0.5);
+            rgb10 = blendCursor(rgb10, px10 - 0.5);
+            rgb01 = blendCursor(rgb01, px01 - 0.5);
+            rgb11 = blendCursor(rgb11, px11 - 0.5);
+        }
+        if (kConvertGamut) {
+            rgb00 = convertGamut(rgb00);
+            rgb10 = convertGamut(rgb10);
+            rgb01 = convertGamut(rgb01);
+            rgb11 = convertGamut(rgb11);
+        }
+        chromaRgb = 0.25 * (rgb00 + rgb10 + rgb01 + rgb11);
+    }
+
+    vec4 ys = vec4(
+        dot(pc.yCoeffs.xyz, rgb00),
+        dot(pc.yCoeffs.xyz, rgb10),
+        dot(pc.yCoeffs.xyz, rgb01),
+        dot(pc.yCoeffs.xyz, rgb11)
+    ) + pc.yCoeffs.w;
+
+    float cb = dot(pc.cbCoeffs.xyz, chromaRgb) + pc.cbCoeffs.w;
+    float cr = dot(pc.crCoeffs.xyz, chromaRgb) + pc.crCoeffs.w;
+
+#if P010
+    ys = round(clamp(ys, 0.0, 1.0) * 1023.0) * (64.0 / 65535.0);
+    cb = round(clamp(cb, 0.0, 1.0) * 1023.0) * (64.0 / 65535.0);
+    cr = round(clamp(cr, 0.0, 1.0) * 1023.0) * (64.0 / 65535.0);
+#else
+    if (kEnableDither) {
+        ys += ignTriangular2x2(vec2(c00));
+        float dc = ignTriangular(vec2(uvCoord));
+        cb += dc;
+        cr -= dc;
+    }
+    ys = clamp(ys, 0.0, 1.0);
+    cb = clamp(cb, 0.0, 1.0);
+    cr = clamp(cr, 0.0, 1.0);
+#endif
+
+    imageStore(uDstY, c00, vec4(ys.x, 0.0, 0.0, 1.0));
+    imageStore(uDstY, c10, vec4(ys.y, 0.0, 0.0, 1.0));
+    imageStore(uDstY, c01, vec4(ys.z, 0.0, 0.0, 1.0));
+    imageStore(uDstY, c11, vec4(ys.w, 0.0, 0.0, 1.0));
+    imageStore(uDstUV, ivec2(uvCoord), vec4(cb, cr, 0.0, 1.0));
+}
