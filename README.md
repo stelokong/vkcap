@@ -212,4 +212,3 @@ Immediately on entry to `main()`, `init_least_privilege()` executes:
 
 ## Further Reading
 - PERFORMANCE.md — How `vkcap-kms` achieves minimal overhead, high visual quality, and color/audio accuracy compared to other Linux screen recorders.
-- DEVELOPMENT.md — Detailed engineering history of `vkcap-kms`, its lineage as a fork/evolution of `rec_pipewire`, and every technical pitfall solved along the way.
