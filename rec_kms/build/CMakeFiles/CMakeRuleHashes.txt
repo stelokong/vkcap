@@ -1,5 +1,0 @@
-# Hashes of file build rules.
-9a828c2a512bdf1d68a7ec80ca1d4a44 generated/shaders/rgb_to_yuv_nv12.spv
-0be94750e6005eba4f273728b83beb00 generated/shaders/rgb_to_yuv_nv12_spv.hpp
-54a5682a1720450224b1102234e7ac63 generated/shaders/rgb_to_yuv_p010.spv
-79049c6c1933afb63c3db9c2527d5218 generated/shaders/rgb_to_yuv_p010_spv.hpp

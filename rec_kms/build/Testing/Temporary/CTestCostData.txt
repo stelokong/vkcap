@@ -1,2 +1,0 @@
-vkcap_kms_tests 9 0.402573
----

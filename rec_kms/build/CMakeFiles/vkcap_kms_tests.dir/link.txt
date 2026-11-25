@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/vkcap_kms_tests.dir/link.d CMakeFiles/vkcap_kms_tests.dir/tests/test_main.cpp.o -o vkcap_kms_tests  libvkcap_kms_core.a /usr/lib/libvulkan.so /usr/lib/libdrm.so /usr/lib/libpipewire-0.3.so /usr/lib/libavformat.so /usr/lib/libavcodec.so /usr/lib/libavutil.so
