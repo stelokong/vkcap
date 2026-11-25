@@ -16,7 +16,6 @@ Because video capture bypasses PipeWire Screencast and `xdg-desktop-portal` enti
 
 ### Build
 ```bash
-cd rec_kms
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
