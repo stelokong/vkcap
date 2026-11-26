@@ -135,6 +135,7 @@ std::expected<std::optional<Config>, std::string> load_user_defaults(const std::
 
     Config cfg{};
     std::string container_ext = ".mkv";
+    std::string output_dir;
     std::string line;
     while (std::getline(in, line)) {
         std::string trimmed = trim_sv(line);
@@ -147,6 +148,7 @@ std::expected<std::optional<Config>, std::string> load_user_defaults(const std::
         if (k == "display") cfg.display = v;
         else if (k == "profile") cfg.profile = v;
         else if (k == "container_ext") container_ext = v.empty() ? ".mkv" : v;
+        else if (k == "output_dir") output_dir = v;
         else if (k == "fps") parse_num(v, cfg.fps);
         else if (k == "out_width") parse_num(v, cfg.out_width);
         else if (k == "out_height") parse_num(v, cfg.out_height);
@@ -211,7 +213,12 @@ std::expected<std::optional<Config>, std::string> load_user_defaults(const std::
         else if (k == "queue_size") parse_num(v, cfg.queue_size);
     }
 
-    cfg.output_path = default_output_filename(container_ext);
+    if (!output_dir.empty()) {
+        cfg.output_path = (std::filesystem::path(expand_user_path(output_dir)) /
+                           default_output_filename(container_ext)).string();
+    } else {
+        cfg.output_path = default_output_filename(container_ext);
+    }
     return std::optional<Config>{std::move(cfg)};
 }
 
@@ -234,6 +241,9 @@ std::expected<void, std::string> save_user_defaults(const Config &cfg, const std
     out << "display=" << cfg.display << '\n';
     out << "profile=" << cfg.profile << '\n';
     out << "container_ext=" << extract_ext(cfg.output_path) << '\n';
+    if (std::filesystem::path p(cfg.output_path); p.has_parent_path()) {
+        out << "output_dir=" << p.parent_path().string() << '\n';
+    }
     out << "fps=" << cfg.fps << '\n';
     out << "out_width=" << cfg.out_width << '\n';
     out << "out_height=" << cfg.out_height << '\n';

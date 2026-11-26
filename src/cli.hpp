@@ -89,5 +89,6 @@ constexpr int max_qp_for_codec(Codec c) noexcept { return c == Codec::Av1 ? 255 
 constexpr int default_qp_for_codec(Codec c) noexcept { return c == Codec::Av1 ? 52 : 22; }
 void print_help(const char *prog_name);
 std::string default_output_filename(std::string_view ext = ".mkv");
+std::string expand_user_path(std::string_view path);
 
 }  // namespace vkcap

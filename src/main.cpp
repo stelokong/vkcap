@@ -94,6 +94,7 @@ int main(int argc, char **argv) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGHUP, &sa, nullptr);
 
     auto res = vkcap::run_kms_pipeline(cfg, g_stop);
     if (!res) {

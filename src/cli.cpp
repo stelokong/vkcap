@@ -4,6 +4,7 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <cstdlib>
 #include <ctime>
 #include <format>
 #include <getopt.h>
@@ -235,11 +236,26 @@ std::expected<int64_t, std::string> parse_bitrate(const std::string &str) {
     return static_cast<int64_t>(val * static_cast<double>(mult));
 }
 
+std::string expand_user_path(std::string_view path) {
+    if (path.size() >= 2 && path[0] == '~' && path[1] == '/') {
+        if (const char *home = std::getenv("HOME"); home && home[0] != '\0') {
+            return std::string(home) + std::string(path.substr(1));
+        }
+    }
+    return std::string(path);
+}
+
 std::expected<std::pair<uint32_t, uint32_t>, std::string> parse_resolution(const std::string &str) {
+    const std::string lo = to_lower_copy(str);
+    if (lo == "720p" || lo == "hd") return std::pair<uint32_t, uint32_t>{1280, 720};
+    if (lo == "1080p" || lo == "fhd") return std::pair<uint32_t, uint32_t>{1920, 1080};
+    if (lo == "1440p" || lo == "qhd" || lo == "2k") return std::pair<uint32_t, uint32_t>{2560, 1440};
+    if (lo == "2160p" || lo == "4k" || lo == "uhd") return std::pair<uint32_t, uint32_t>{3840, 2160};
+
     auto pos = str.find('x');
     if (pos == std::string::npos) pos = str.find('X');
     if (pos == std::string::npos || pos == 0 || pos + 1 >= str.size()) {
-        return std::unexpected(std::format("Invalid resolution '{}', expected WxH", str));
+        return std::unexpected(std::format("Invalid resolution '{}', expected WxH or preset (720p, 1080p, 1440p, 4k)", str));
     }
     uint32_t w = 0, h = 0;
     auto [pw, ew] = std::from_chars(str.data(), str.data() + pos, w);
@@ -671,6 +687,8 @@ std::expected<Config, std::string> parse_args(int argc, char **argv) {
     }
     if (cfg.output_path.empty()) {
         cfg.output_path = default_output_filename();
+    } else {
+        cfg.output_path = expand_user_path(cfg.output_path);
     }
     return cfg;
 }

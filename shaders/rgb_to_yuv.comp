@@ -146,23 +146,23 @@ vec3 convertGamut(vec3 srgb) {
 }
 
 #if !P010
-// Single-hash static spatial Interleaved Gradient Noise -> triangular PDF in [-0.5, +0.5] LSB
+// Zero-sqrt static spatial Interleaved Gradient Noise -> triangular PDF in [-0.5, +0.5] LSB
+// Uses difference of two uncorrelated uniform IGN hashes (pure full-rate VALU, zero SFU sqrt)
 const vec2 kIgnVec = vec2(0.06711056, 0.00583715);
 
 float ignTriangular(vec2 p) {
-    float n = fract(52.9829189 * fract(dot(p, kIgnVec)));
-    float t = n * 2.0 - 1.0;
-    float tri = sign(t) * (1.0 - sqrt(max(1.0 - abs(t), 0.0)));
-    return tri * (0.5 / 255.0);
+    float d = dot(p, kIgnVec);
+    float n1 = fract(52.9829189 * fract(d));
+    float n2 = fract(37.7192837 * fract(d + 0.3819660));
+    return (n1 - n2) * (0.5 / 255.0);
 }
 
 vec4 ignTriangular2x2(vec2 basePx) {
     float d00 = dot(basePx, kIgnVec);
     vec4 d = d00 + vec4(0.0, kIgnVec.x, kIgnVec.y, kIgnVec.x + kIgnVec.y);
-    vec4 n = fract(52.9829189 * fract(d));
-    vec4 t = n * 2.0 - 1.0;
-    vec4 tri = sign(t) * (1.0 - sqrt(max(1.0 - abs(t), vec4(0.0))));
-    return tri * (0.5 / 255.0);
+    vec4 n1 = fract(52.9829189 * fract(d));
+    vec4 n2 = fract(37.7192837 * fract(d + 0.3819660));
+    return (n1 - n2) * (0.5 / 255.0);
 }
 #endif
 

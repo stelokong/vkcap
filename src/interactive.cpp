@@ -307,7 +307,7 @@ bool prompt_resolution_and_output(std::istream &in, std::ostream &out,
         if (!prompt_line(in, out, std::format("Output file (.mkv, .mp4, .webm, .ivf) [{}]: ", def_out), ans)) {
             return false;
         }
-        cfg.output_path = ans.empty() ? def_out : ans;
+        cfg.output_path = ans.empty() ? def_out : expand_user_path(ans);
     }
     return true;
 }
@@ -323,8 +323,36 @@ std::string format_equiv_cli(const Config &cfg, const char *prog_name) {
         else if (cfg.codec == Codec::H264) cmd += " --codec h264";
         if (cfg.pixfmt == PixelFormat::P010) cmd += " --pixfmt p010";
         if (cfg.rc == RateControl::Cqp && cfg.qp >= 0) cmd += std::format(" --rc cqp --qp {}", cfg.qp);
-        else if (cfg.rc == RateControl::Vbr && cfg.bitrate > 0) cmd += std::format(" --rc vbr -b {}k", cfg.bitrate / 1000);
-        else if (cfg.rc == RateControl::Cbr && cfg.bitrate > 0) cmd += std::format(" --rc cbr -b {}k", cfg.bitrate / 1000);
+        else if (cfg.rc == RateControl::Vbr && cfg.bitrate > 0) {
+            cmd += std::format(" --rc vbr -b {}k", cfg.bitrate / 1000);
+            if (cfg.max_bitrate > 0) cmd += std::format(" --max-bitrate {}k", cfg.max_bitrate / 1000);
+        } else if (cfg.rc == RateControl::Cbr && cfg.bitrate > 0) {
+            cmd += std::format(" --rc cbr -b {}k", cfg.bitrate / 1000);
+        }
+        if (cfg.quality >= 0 && cfg.quality != 1) cmd += std::format(" --quality {}", cfg.quality);
+        if (cfg.tune == Tune::Default) cmd += " --tune default";
+        else if (cfg.tune == Tune::Ll) cmd += " --tune ll";
+        else if (cfg.tune == Tune::Ull) cmd += " --tune ull";
+        else if (cfg.tune == Tune::Lossless) cmd += " --tune lossless";
+        if (cfg.usage == Usage::Default) cmd += " --usage default";
+        else if (cfg.usage == Usage::Stream) cmd += " --usage stream";
+        else if (cfg.usage == Usage::Transcode) cmd += " --usage transcode";
+        else if (cfg.usage == Usage::Conference) cmd += " --usage conference";
+        if (cfg.content == Content::Default) cmd += " --content default";
+        else if (cfg.content == Content::Desktop) cmd += " --content desktop";
+        else if (cfg.content == Content::Camera) cmd += " --content camera";
+        if (cfg.idr_interval > 0) cmd += std::format(" --idr-interval {}", cfg.idr_interval);
+        if (cfg.async_depth != 4) cmd += std::format(" --async-depth {}", cfg.async_depth);
+        if (cfg.b_depth != 1) cmd += std::format(" --b-depth {}", cfg.b_depth);
+        if (cfg.device_index != 0) cmd += std::format(" --device {}", cfg.device_index);
+        if (cfg.queue_size != 4) cmd += std::format(" --queue-size {}", cfg.queue_size);
+        if (cfg.input_gamut == InputGamut::Edid) cmd += " --input-gamut edid";
+        else if (cfg.input_gamut == InputGamut::Srgb) cmd += " --input-gamut srgb";
+        else if (cfg.input_gamut == InputGamut::DisplayP3) cmd += " --input-gamut p3";
+        else if (cfg.input_gamut == InputGamut::Bt2020) cmd += " --input-gamut bt2020";
+        if (cfg.color_space == ColorSpace::Bt2020) cmd += " --color-space bt2020";
+        if (cfg.color_range == ColorRange::Full) cmd += " --color-range full";
+        if (cfg.pixfmt == PixelFormat::Nv12 && !cfg.dither) cmd += " --no-dither";
     }
     if (!cfg.audio || (!cfg.capture_system_audio && !cfg.capture_mic)) {
         cmd += " --no-sound";
@@ -444,6 +472,7 @@ std::expected<bool, std::string> run_interactive_setup(
                 {"hevc (H.265)", Codec::Hevc},
                 {"h264 (AVC)", Codec::H264},
             }, 0, cfg.codec)) return false;
+        cfg.codec_explicit = true;
 
         if (!prompt_choice<PixelFormat>(in, out, "Pixel format:", {
                 {"nv12 (8-bit + static IGN dithering)", PixelFormat::Nv12},
@@ -542,6 +571,7 @@ std::expected<bool, std::string> run_interactive_setup(
         int dev_idx = 0;
         if (!prompt_int(in, out, "Vulkan GPU device index", 0, 0, 16, dev_idx)) return false;
         cfg.device_index = static_cast<uint32_t>(dev_idx);
+        cfg.device_explicit = (dev_idx != 0);
         int qsz = 4;
         if (!prompt_int(in, out, "GPU-to-encoder queue depth (1..64)", 4, 1, 64, qsz)) return false;
         cfg.queue_size = static_cast<size_t>(qsz);

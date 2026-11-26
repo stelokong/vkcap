@@ -41,7 +41,6 @@ void sleep_until_monotonic_ns(int64_t target_ns) {
 
 struct EncodedInput {
     AVFrame *frame = nullptr;
-    uint32_t slot = 0;
     int64_t pts_ticks = 0;
 };
 
@@ -50,13 +49,12 @@ public:
     explicit EncodeFrameQueue(size_t capacity)
         : capacity_(std::max<size_t>(1, capacity)), ring_(capacity_) {}
 
-    void push(AVFrame *frame, uint32_t slot, int64_t pts_ticks, VulkanCompute *vk = nullptr) {
+    void push(AVFrame *frame, int64_t pts_ticks) {
         AVFrame *evicted = nullptr;
         {
             std::lock_guard lk(mtx_);
             if (closed_) {
-                if (vk) vk->recycle_frame(frame);
-                else av_frame_free(&frame);
+                av_frame_free(&frame);
                 return;
             }
             if (count_ == capacity_) {
@@ -65,14 +63,11 @@ public:
                 --count_;
                 ++dropped_;
             }
-            ring_[tail_] = {frame, slot, pts_ticks};
+            ring_[tail_] = {frame, pts_ticks};
             tail_ = (tail_ + 1) % capacity_;
             ++count_;
         }
-        if (evicted) {
-            if (vk) vk->recycle_frame(evicted);
-            else av_frame_free(&evicted);
-        }
+        if (evicted) av_frame_free(&evicted);
         cv_.notify_one();
     }
 
@@ -129,11 +124,8 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
     const auto &disp = kms->display();
     const ResolvedGamut gamut = resolve_input_gamut(cfg, disp.edid_primaries);
 
-    auto vk_res = VulkanCompute::create(cfg, gamut.enabled, gamut.matrix, disp.card_path);
-    if (!vk_res) return std::unexpected(vk_res.error());
-    auto vk = std::move(*vk_res);
-
-    // Probe the first KMS frame to verify CAP_SYS_ADMIN and obtain exact scanout dimensions
+    // Probe the first KMS frame BEFORE initializing Vulkan so missing CAP_SYS_ADMIN fails
+    // instantaneously and exact scanout dimensions are known upfront.
     auto first_res = kms->grab_frame();
     if (!first_res) return std::unexpected(first_res.error());
 
@@ -141,6 +133,10 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
     const uint32_t src_h = first_res->primary.height;
     const uint32_t enc_w = cfg.out_width ? cfg.out_width : (src_w & ~1u);
     const uint32_t enc_h = cfg.out_height ? cfg.out_height : (src_h & ~1u);
+
+    auto vk_res = VulkanCompute::create(cfg, gamut.enabled, gamut.matrix, disp.card_path);
+    if (!vk_res) return std::unexpected(vk_res.error());
+    auto vk = std::move(*vk_res);
 
     auto cfg_res = vk->configure_output(enc_w, enc_h);
     if (!cfg_res) return std::unexpected(cfg_res.error());
@@ -230,9 +226,8 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
         pthread_setname_np(pthread_self(), "vkcap-enc");
         EncodedInput item{};
         while (encode_queue.pop(item)) {
-            vk->wait_slot(item.slot);
             auto enc_err = encoder->encode_frame(item.frame, item.pts_ticks);
-            vk->recycle_frame(item.frame);
+            av_frame_free(&item.frame);
             if (!enc_err) {
                 record_err(enc_err.error());
                 break;
@@ -251,9 +246,17 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
                 double avg_comp_ms = cst.frames_processed > 0
                     ? (static_cast<double>(cst.total_compute_ns) / static_cast<double>(cst.frames_processed)) / 1e6
                     : 0.0;
+                const int total_sec = static_cast<int>(elapsed_total);
+                const int hrs = total_sec / 3600;
+                const int mins = (total_sec % 3600) / 60;
+                const int secs = total_sec % 60;
+                const std::string time_str = (hrs > 0)
+                    ? std::format("{}:{:02d}:{:02d}", hrs, mins, secs)
+                    : std::format("{:02d}:{:02d}", mins, secs);
+                const double mib = static_cast<double>(est.bytes_written) / (1024.0 * 1024.0);
                 std::cerr << std::format(
-                    "\r[vkcap] {:.1f} fps | {} frames | {} dropped | {:.2f} Mbps | compute {:.2f} ms/f   ",
-                    inst_fps, est.frames_submitted, encode_queue.dropped(), mbps, avg_comp_ms)
+                    "\r[vkcap] {} | {:.1f} fps | {} frames | {} dropped | {:.2f} Mbps ({:.1f} MiB) | compute {:.2f} ms/f   ",
+                    time_str, inst_fps, est.frames_submitted, encode_queue.dropped(), mbps, mib, avg_comp_ms)
                           << std::flush;
                 last_enc_frames = est.frames_submitted;
                 last_report = now;
@@ -304,27 +307,26 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
         });
     }
 
-    // Submit the already-grabbed first frame immediately (asynchronously on compute_dev)
+    // Submit the already-grabbed first frame immediately
     {
-        auto gpu_res = vk->submit_frame(*first_res);
+        auto gpu_res = vk->process_frame(*first_res);
         if (!gpu_res) {
             record_err(gpu_res.error());
         } else {
-            encode_queue.push(gpu_res->frame, gpu_res->slot, frame_idx++, vk.get());
+            encode_queue.push(*gpu_res, frame_idx++);
         }
     }
 
-    while (!stop_flag.load(std::memory_order_acquire)) {
-        if (cfg.duration_sec > 0.0) {
-            double elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - start_wall).count();
-            if (elapsed >= cfg.duration_sec) {
-                break;
-            }
-        }
+    const int64_t end_ns = (cfg.duration_sec > 0.0)
+        ? (base_ns + static_cast<int64_t>(cfg.duration_sec * 1e9))
+        : 0;
 
+    while (!stop_flag.load(std::memory_order_acquire)) {
         int64_t target_ns = base_ns + (frame_idx * 1'000'000'000LL) / static_cast<int64_t>(cfg.fps);
         int64_t now_ns = monotonic_now_ns();
+        if (end_ns > 0 && now_ns >= end_ns) {
+            break;
+        }
         if (now_ns < target_ns) {
             sleep_until_monotonic_ns(target_ns);
         } else if (now_ns - target_ns > frame_interval_ns * 2) {
@@ -343,12 +345,12 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
             continue;
         }
 
-        auto gpu_res = vk->submit_frame(*frame_res);
+        auto gpu_res = vk->process_frame(*frame_res);
         if (!gpu_res) {
             record_err(gpu_res.error());
             break;
         }
-        encode_queue.push(gpu_res->frame, gpu_res->slot, frame_idx++, vk.get());
+        encode_queue.push(*gpu_res, frame_idx++);
     }
 
     audio_stop.store(true, std::memory_order_release);

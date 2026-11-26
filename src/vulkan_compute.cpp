@@ -9,11 +9,11 @@
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <format>
 #include <iostream>
 #include <libdrm/drm_fourcc.h>
 #include <linux/dma-buf.h>
-#include <mutex>
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -107,15 +107,22 @@ struct CmdSlot {
     VkSemaphore ext_wait_sem = VK_NULL_HANDLE;
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     VkDescriptorSet desc_set = VK_NULL_HANDLE;
-    std::mutex mtx;
-    bool in_flight = false;
-    std::chrono::steady_clock::time_point submit_t0{};
 };
 
 // Matches a DRM /dev/dri/card* node to its Vulkan physical device index via VK_EXT_physical_device_drm.
-// Falls back to default_idx if matching is unavailable or --device was explicitly specified.
+// Skips creating a temporary VkInstance on single-GPU systems so no extra Vulkan layers are loaded.
 uint32_t resolve_vulkan_device_index(uint32_t default_idx, bool explicit_dev, std::string_view drm_card_path) {
     if (explicit_dev || drm_card_path.empty()) return default_idx;
+
+    size_t card_count = 0;
+    std::error_code ec;
+    for (const auto &entry : std::filesystem::directory_iterator("/dev/dri", ec)) {
+        std::string name = entry.path().filename().string();
+        if (name.starts_with("card") && name.size() > 4 && std::isdigit(static_cast<unsigned char>(name[4]))) {
+            ++card_count;
+        }
+    }
+    if (card_count <= 1) return default_idx;
 
     struct stat st{};
     std::string path_str(drm_card_path);
@@ -282,8 +289,6 @@ struct VulkanCompute::Impl {
     std::vector<CachedSrcImage> src_cache;
     std::vector<CachedDstAlias> dst_alias_cache;
     std::array<AVFrame *, 8> probe_shells{};
-    std::mutex shell_mtx;
-    std::vector<AVFrame *> recycled_shells;
 
     uint32_t out_width = 0;
     uint32_t out_height = 0;
@@ -330,46 +335,7 @@ struct VulkanCompute::Impl {
         d = {};
     }
 
-    void wait_slot_impl(size_t idx) noexcept {
-        if (idx >= kNumSlots) return;
-        CmdSlot &sl = slots[idx];
-        std::lock_guard lk(sl.mtx);
-        if (!sl.in_flight) return;
-        pfn_wait_fences(compute_dev, 1, &sl.fence, VK_TRUE, UINT64_MAX);
-        const auto t1 = std::chrono::steady_clock::now();
-        stat_frames_processed.fetch_add(1, std::memory_order_relaxed);
-        stat_total_compute_ns.fetch_add(
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - sl.submit_t0).count()),
-            std::memory_order_relaxed);
-        sl.in_flight = false;
-    }
-
-    AVFrame *acquire_shell() noexcept {
-        {
-            std::lock_guard lk(shell_mtx);
-            if (!recycled_shells.empty()) {
-                AVFrame *f = recycled_shells.back();
-                recycled_shells.pop_back();
-                return f;
-            }
-        }
-        return av_frame_alloc();
-    }
-
-    void recycle_shell(AVFrame *&frame) noexcept {
-        if (!frame) return;
-        av_frame_unref(frame);
-        std::lock_guard lk(shell_mtx);
-        if (recycled_shells.size() < 16) {
-            recycled_shells.push_back(frame);
-            frame = nullptr;
-            return;
-        }
-        av_frame_free(&frame);
-    }
-
     void clear_caches() {
-        for (size_t i = 0; i < kNumSlots; ++i) wait_slot_impl(i);
         if (pfn_device_wait_idle && compute_dev) {
             pfn_device_wait_idle(compute_dev);
         }
@@ -382,13 +348,6 @@ struct VulkanCompute::Impl {
     ~Impl() {
         for (auto *&f : probe_shells) {
             if (f) av_frame_free(&f);
-        }
-        {
-            std::lock_guard lk(shell_mtx);
-            for (auto *&f : recycled_shells) {
-                if (f) av_frame_free(&f);
-            }
-            recycled_shells.clear();
         }
         if (!compute_dev) {
             av_buffer_unref(&hw_frames_ref);
@@ -742,7 +701,6 @@ struct VulkanCompute::Impl {
 
         src_cache.reserve(kMaxCachedSurfaces);
         dst_alias_cache.reserve(32);
-        recycled_shells.reserve(16);
 
         // Pre-compile the expected 1:1 (or scaled) pipeline variant(s) at startup so frame 0 has zero compile stall
         const bool likely_1to1 = (cfg.out_width == 0 && cfg.out_height == 0);
@@ -1056,7 +1014,6 @@ struct VulkanCompute::Impl {
                     }
                     return SrcBinding{src_cache[0].image, src_cache[0].view};
                 }
-                for (size_t s = 0; s < kNumSlots; ++s) wait_slot_impl(s);
                 destroy_src_image(c);
                 src_cache.erase(src_cache.begin() + static_cast<ptrdiff_t>(i));
                 break;
@@ -1065,7 +1022,6 @@ struct VulkanCompute::Impl {
 
         // Evict least-recently-used tail entry when full
         if (src_cache.size() >= kMaxCachedSurfaces) {
-            for (size_t s = 0; s < kNumSlots; ++s) wait_slot_impl(s);
             destroy_src_image(src_cache.back());
             src_cache.pop_back();
         }
@@ -1320,7 +1276,7 @@ std::expected<void, std::string> VulkanCompute::configure_output(uint32_t width,
     return {};
 }
 
-std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_frame(const KmsFrame &kf) {
+std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFrame &kf) {
     if (!impl_->hw_frames_ref) return std::unexpected("VulkanCompute output not configured");
 
     // LIFO pool probing using reusable empty AVFrame shells to avoid malloc/free thrashing
@@ -1329,7 +1285,7 @@ std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_
 
     for (size_t attempt = 0; attempt < impl_->probe_shells.size(); ++attempt) {
         if (!impl_->probe_shells[attempt]) {
-            impl_->probe_shells[attempt] = impl_->acquire_shell();
+            impl_->probe_shells[attempt] = av_frame_alloc();
             if (!impl_->probe_shells[attempt]) break;
         }
         AVFrame *cand = impl_->probe_shells[attempt];
@@ -1373,14 +1329,14 @@ std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_
     auto *vkf = reinterpret_cast<AVVkFrame *>(dst_frame->data[0]);
     auto dst_alias_res = impl_->get_or_create_dst_alias(vkf);
     if (!dst_alias_res) {
-        impl_->recycle_shell(dst_frame);
+        av_frame_free(&dst_frame);
         return std::unexpected(dst_alias_res.error());
     }
     CachedDstAlias *dst_alias = *dst_alias_res;
 
     auto src_res = impl_->get_or_import_surface(kf.primary);
     if (!src_res) {
-        impl_->recycle_shell(dst_frame);
+        av_frame_free(&dst_frame);
         return std::unexpected(src_res.error());
     }
     const SrcBinding src = *src_res;
@@ -1406,18 +1362,15 @@ std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_
 
     auto pipe_res = impl_->get_or_create_pipeline(exact_1to1, has_cursor);
     if (!pipe_res) {
-        impl_->recycle_shell(dst_frame);
+        av_frame_free(&dst_frame);
         return std::unexpected(pipe_res.error());
     }
     VkPipeline pipe = *pipe_res;
 
     const auto t0 = std::chrono::steady_clock::now();
 
-    const size_t slot_idx = impl_->slot_cursor;
+    CmdSlot &sl = impl_->slots[impl_->slot_cursor];
     impl_->slot_cursor = (impl_->slot_cursor + 1) % Impl::kNumSlots;
-    // Wait on this slot only if it is still in flight from kNumSlots frames ago
-    impl_->wait_slot_impl(slot_idx);
-    CmdSlot &sl = impl_->slots[slot_idx];
 
     impl_->pfn_reset_cp(impl_->compute_dev, sl.pool, 0);
     impl_->pfn_reset_fences(impl_->compute_dev, 1, &sl.fence);
@@ -1425,7 +1378,7 @@ std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr,
                                   VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
     if (impl_->pfn_begin_cb(sl.cmd, &cbbi) != VK_SUCCESS) {
-        impl_->recycle_shell(dst_frame);
+        av_frame_free(&dst_frame);
         return std::unexpected("vkBeginCommandBuffer failed");
     }
 
@@ -1497,24 +1450,18 @@ std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_
         b.image = cur_img.image;
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     }
-    {
+    if (!dst_alias->initialized_layout) {
         auto &b = pre_barriers[nb_pre++];
         b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        if (!dst_alias->initialized_layout) {
-            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            dst_alias->initialized_layout = true;
-        } else {
-            b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
-            b.dstQueueFamilyIndex = impl_->compute_qf_idx;
-        }
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.image = dst_alias->image;
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        dst_alias->initialized_layout = true;
     }
 
     VkDependencyInfo dep_pre{VK_STRUCTURE_TYPE_DEPENDENCY_INFO, nullptr, 0, 0, nullptr, 0, nullptr, nb_pre, pre_barriers.data()};
@@ -1600,7 +1547,7 @@ std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_
     impl_->pfn_cmd_barrier2(sl.cmd, &dep_post);
 
     if (impl_->pfn_end_cb(sl.cmd) != VK_SUCCESS) {
-        impl_->recycle_shell(dst_frame);
+        av_frame_free(&dst_frame);
         return std::unexpected("vkEndCommandBuffer failed");
     }
 
@@ -1611,15 +1558,12 @@ std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_
                       has_ext_sem ? 1u : 0u, has_ext_sem ? &wait_ext : nullptr,
                       1, &cbsi, 0, nullptr};
 
-    {
-        std::lock_guard lk(sl.mtx);
-        sl.submit_t0 = t0;
-        if (impl_->pfn_queue_submit2(impl_->compute_queue, 1, &si2, sl.fence) != VK_SUCCESS) {
-            impl_->recycle_shell(dst_frame);
-            return std::unexpected("vkQueueSubmit2 failed for compute color conversion");
-        }
-        sl.in_flight = true;
+    if (impl_->pfn_queue_submit2(impl_->compute_queue, 1, &si2, sl.fence) != VK_SUCCESS) {
+        av_frame_free(&dst_frame);
+        return std::unexpected("vkQueueSubmit2 failed for compute color conversion");
     }
+
+    impl_->pfn_wait_fences(impl_->compute_dev, 1, &sl.fence, VK_TRUE, UINT64_MAX);
 
     dst_frame->color_range = (impl_->cfg.color_range == ColorRange::Full) ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
     dst_frame->colorspace = (impl_->cfg.color_space == ColorSpace::Bt2020) ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709;
@@ -1627,22 +1571,13 @@ std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_
     dst_frame->color_trc = (impl_->cfg.color_space == ColorSpace::Bt2020) ? AVCOL_TRC_BT2020_10 : AVCOL_TRC_BT709;
     dst_frame->chroma_location = AVCHROMA_LOC_LEFT;
 
-    return SubmittedFrame{dst_frame, static_cast<uint32_t>(slot_idx)};
-}
+    const auto t1 = std::chrono::steady_clock::now();
+    impl_->stat_frames_processed.fetch_add(1, std::memory_order_relaxed);
+    impl_->stat_total_compute_ns.fetch_add(
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
+        std::memory_order_relaxed);
 
-void VulkanCompute::wait_slot(uint32_t slot) noexcept {
-    impl_->wait_slot_impl(slot);
-}
-
-void VulkanCompute::recycle_frame(AVFrame *&frame) noexcept {
-    impl_->recycle_shell(frame);
-}
-
-std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFrame &kf) {
-    auto sub = submit_frame(kf);
-    if (!sub) return std::unexpected(sub.error());
-    wait_slot(sub->slot);
-    return sub->frame;
+    return dst_frame;
 }
 
 AVBufferRef *VulkanCompute::hw_device_ref() const noexcept { return impl_->hw_device_ref; }

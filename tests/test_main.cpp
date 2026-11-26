@@ -52,6 +52,19 @@ void test_cli_and_privileges() {
     check(cfg->pixfmt == PixelFormat::P010, "pixfmt p010");
     check(!cfg->capture_cursor, "no-cursor");
 
+    // Verify resolution shorthand presets and tilde path expansion
+    {
+        auto r1 = parse_resolution("1080p");
+        check(r1.has_value() && r1->first == 1920 && r1->second == 1080, "parse_resolution 1080p");
+        auto r2 = parse_resolution("4K");
+        check(r2.has_value() && r2->first == 3840 && r2->second == 2160, "parse_resolution 4K");
+        if (const char *home = std::getenv("HOME"); home && home[0] != '\0') {
+            check(expand_user_path("~/Videos/test.mkv") == std::string(home) + "/Videos/test.mkv",
+                  "expand_user_path ~/");
+        }
+        check(expand_user_path("relative.mkv") == "relative.mkv", "expand_user_path relative unchanged");
+    }
+
     auto disps = KmsCapture::enumerate_displays();
     check(disps.has_value(), "enumerate_displays succeeds without CAP_SYS_ADMIN");
 
@@ -362,7 +375,7 @@ void test_kms_gpu_pipeline(PixelFormat pixfmt,
         check(fres.has_value(), "VulkanCompute::process_frame");
         AVFrame *avf = *fres;
         check(enc->encode_frame(avf, static_cast<int64_t>(i)).has_value(), "VideoEncoder::encode_frame");
-        vk->recycle_frame(avf);
+        av_frame_free(&avf);
     }
     if (with_audio) {
         const int afsz = enc->audio_frame_size();

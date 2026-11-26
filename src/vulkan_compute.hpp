@@ -41,22 +41,9 @@ public:
     /// Initializes or re-initializes the FFmpeg AVHWFramesContext for the target video size.
     std::expected<void, std::string> configure_output(uint32_t width, uint32_t height);
 
-    struct SubmittedFrame {
-        AVFrame *frame = nullptr;
-        uint32_t slot = 0;
-    };
-
-    /// Submits rgb_to_yuv.comp asynchronously on compute_dev without blocking the caller.
-    /// Call wait_slot(sub.slot) before passing sub.frame to the video encoder.
-    std::expected<SubmittedFrame, std::string> submit_frame(const KmsFrame &frame);
-
-    /// Waits for an asynchronously submitted compute slot to finish on the GPU.
-    void wait_slot(uint32_t slot) noexcept;
-
-    /// Returns a consumed AVFrame shell to the internal pool to avoid per-frame malloc/free.
-    void recycle_frame(AVFrame *&frame) noexcept;
-
-    /// Synchronous convenience wrapper: submit_frame() + wait_slot().
+    /// Imports/looks up the KMS primary (and optional cursor) DMA-BUF surfaces on the isolated
+    /// low-priority compute_dev, runs rgb_to_yuv.comp into an idle AVVkFrame alias, and returns
+    /// the GPU-resident AVFrame ready for Vulkan Video encoding.
     std::expected<AVFrame *, std::string> process_frame(const KmsFrame &frame);
 
     AVBufferRef *hw_device_ref() const noexcept;

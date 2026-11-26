@@ -4,6 +4,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <filesystem>
 #include <format>
 #include <iostream>
 #include <mutex>
@@ -200,10 +201,19 @@ struct VideoEncoder::Impl {
         free_pkts.reserve(32);
         writer_thread = std::jthread([this](std::stop_token) {
             pthread_setname_np(pthread_self(), "vkcap-mux");
+            AVPacket *recycle = nullptr;
             while (true) {
                 AVPacket *p = nullptr;
                 {
                     std::unique_lock lk(pkt_mtx);
+                    if (recycle) {
+                        if (free_pkts.size() < 32) {
+                            free_pkts.push_back(recycle);
+                        } else {
+                            av_packet_free(&recycle);
+                        }
+                        recycle = nullptr;
+                    }
                     pkt_cv.wait(lk, [this] { return writer_stop || pkt_count > 0; });
                     if (pkt_count == 0) {
                         if (writer_stop) break;
@@ -213,25 +223,28 @@ struct VideoEncoder::Impl {
                     pkt_head = (pkt_head + 1) % kMaxQueuedPackets;
                     --pkt_count;
                 }
+                pkt_space_cv.notify_one();
 
                 int w = av_interleaved_write_frame(fmt_ctx, p);
                 av_packet_unref(p);
-
-                {
+                if (w < 0) {
                     std::lock_guard lk(pkt_mtx);
                     if (free_pkts.size() < 32) {
                         free_pkts.push_back(p);
                     } else {
                         av_packet_free(&p);
                     }
-                    if (w < 0 && writer_err.empty()) {
+                    if (writer_err.empty()) {
                         writer_err = std::format("av_interleaved_write_frame failed: {}", ff_err(w));
                         has_writer_err.store(true, std::memory_order_release);
                         pkt_space_cv.notify_all();
-                        break;
                     }
+                    break;
                 }
-                pkt_space_cv.notify_one();
+                recycle = p;
+            }
+            if (recycle) {
+                av_packet_free(&recycle);
             }
         });
     }
@@ -304,6 +317,11 @@ struct VideoEncoder::Impl {
             pkt_ring[pkt_tail] = p;
             pkt_tail = (pkt_tail + 1) % kMaxQueuedPackets;
             ++pkt_count;
+            // Refill scratch packet under the same lock to halve mutex acquisitions
+            if (!free_pkts.empty()) {
+                scratch = free_pkts.back();
+                free_pkts.pop_back();
+            }
             lk.unlock();
             pkt_cv.notify_one();
         }
@@ -468,9 +486,16 @@ std::expected<std::unique_ptr<VideoEncoder>, std::string> VideoEncoder::open(
     // Optional low-latency audio stream (Opus / AAC / FLAC; skipped for video-only .ivf)
     const bool is_ivf = impl->fmt_ctx->oformat->name &&
                         std::strcmp(impl->fmt_ctx->oformat->name, "ivf") == 0;
+    const bool is_webm = impl->fmt_ctx->oformat->name &&
+                         std::strstr(impl->fmt_ctx->oformat->name, "webm") != nullptr;
     if (enable_audio && !is_ivf) {
+        AudioCodec eff_acodec = cfg.audio_codec;
+        if (is_webm && eff_acodec != AudioCodec::Opus) {
+            std::cerr << "[vkcap] Note: WebM container requires Opus audio; switching audio codec to Opus.\n";
+            eff_acodec = AudioCodec::Opus;
+        }
         const AVCodec *acodec = nullptr;
-        switch (cfg.audio_codec) {
+        switch (eff_acodec) {
             case AudioCodec::Opus:
                 acodec = avcodec_find_encoder_by_name("libopus");
                 if (!acodec) acodec = avcodec_find_encoder(AV_CODEC_ID_OPUS);
@@ -514,6 +539,8 @@ std::expected<std::unique_ptr<VideoEncoder>, std::string> VideoEncoder::open(
         if (std::strcmp(acodec->name, "libopus") == 0) {
             av_dict_set(&aopts, "application", "audio", 0);
             av_dict_set(&aopts, "frame_duration", "20", 0);
+            // Complexity 5 cuts real-time Opus CPU usage ~3x vs default 10 with transparent quality at 192 kbps
+            av_dict_set(&aopts, "compression_level", "5", 0);
         }
         err = avcodec_open2(impl->audio_enc_ctx, acodec, &aopts);
         av_dict_free(&aopts);
@@ -539,9 +566,19 @@ std::expected<std::unique_ptr<VideoEncoder>, std::string> VideoEncoder::open(
     }
 
     if (!(impl->fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
-        err = avio_open(&impl->fmt_ctx->pb, cfg.output_path.c_str(), AVIO_FLAG_WRITE);
+        const std::string resolved_out = expand_user_path(cfg.output_path);
+        std::filesystem::path out_p(resolved_out);
+        if (out_p.has_parent_path()) {
+            std::error_code ec;
+            std::filesystem::create_directories(out_p.parent_path(), ec);
+            if (ec) {
+                return std::unexpected(std::format("Failed to create output directory '{}': {}",
+                                                   out_p.parent_path().string(), ec.message()));
+            }
+        }
+        err = avio_open(&impl->fmt_ctx->pb, resolved_out.c_str(), AVIO_FLAG_WRITE);
         if (err < 0) {
-            return std::unexpected(std::format("avio_open('{}') failed: {}", cfg.output_path, ff_err(err)));
+            return std::unexpected(std::format("avio_open('{}') failed: {}", resolved_out, ff_err(err)));
         }
     }
 
