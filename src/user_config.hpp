@@ -9,8 +9,8 @@
 
 namespace vkcap {
 
-/// Returns the user defaults config path ($XDG_CONFIG_HOME/vkcap-kms/defaults.conf
-/// or $HOME/.config/vkcap-kms/defaults.conf).
+/// Returns the user defaults config path ($XDG_CONFIG_HOME/vkcap/defaults.conf
+/// or $HOME/.config/vkcap/defaults.conf).
 std::filesystem::path user_defaults_path();
 
 /// Loads saved user defaults from `path` (if it exists).

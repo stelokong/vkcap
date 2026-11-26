@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(ag-vkcap-kms VERSION 0.1.0 LANGUAGES CXX)
+project(vkcap VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -64,7 +64,7 @@ add_embedded_shader(
     RGB_TO_YUV_P010_HEADER
 )
 
-add_library(vkcap_kms_core STATIC
+add_library(vkcap_core STATIC
     src/audio_capture.cpp
     src/cli.cpp
     src/color_math.cpp
@@ -79,13 +79,13 @@ add_library(vkcap_kms_core STATIC
     "${RGB_TO_YUV_P010_HEADER}"
 )
 
-target_include_directories(vkcap_kms_core
+target_include_directories(vkcap_core
     PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
         "${GENERATED_SHADER_DIR}"
 )
 
-target_link_libraries(vkcap_kms_core
+target_link_libraries(vkcap_core
     PUBLIC
         PkgConfig::VULKAN
         PkgConfig::LIBDRM
@@ -93,28 +93,28 @@ target_link_libraries(vkcap_kms_core
         PkgConfig::FFMPEG
 )
 
-target_compile_options(vkcap_kms_core PRIVATE
+target_compile_options(vkcap_core PRIVATE
     -Wall -Wextra -Wpedantic
     -Wno-missing-field-initializers
     $<$<CONFIG:Release>:-fno-math-errno -fno-trapping-math>
 )
 
-add_executable(vkcap-kms src/main.cpp)
-target_link_libraries(vkcap-kms PRIVATE vkcap_kms_core)
-target_compile_options(vkcap-kms PRIVATE -Wall -Wextra -Wpedantic)
+add_executable(vkcap src/main.cpp)
+target_link_libraries(vkcap PRIVATE vkcap_core)
+target_compile_options(vkcap PRIVATE -Wall -Wextra -Wpedantic)
 
 include(CheckIPOSupported)
 check_ipo_supported(RESULT IPO_SUPPORTED)
 if(IPO_SUPPORTED AND CMAKE_BUILD_TYPE STREQUAL "Release")
-    set_property(TARGET vkcap_kms_core vkcap-kms PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    set_property(TARGET vkcap_core vkcap PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
-install(TARGETS vkcap-kms RUNTIME DESTINATION bin)
+install(TARGETS vkcap RUNTIME DESTINATION bin)
 
 if(BUILD_TESTING)
     enable_testing()
-    add_executable(vkcap_kms_tests tests/test_main.cpp)
-    target_link_libraries(vkcap_kms_tests PRIVATE vkcap_kms_core)
-    target_compile_options(vkcap_kms_tests PRIVATE -Wall -Wextra -Wpedantic)
-    add_test(NAME vkcap_kms_tests COMMAND vkcap_kms_tests)
+    add_executable(vkcap_tests tests/test_main.cpp)
+    target_link_libraries(vkcap_tests PRIVATE vkcap_core)
+    target_compile_options(vkcap_tests PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME vkcap_tests COMMAND vkcap_tests)
 endif()

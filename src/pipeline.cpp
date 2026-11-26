@@ -156,7 +156,7 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
             if (cfg.capture_mic && !cfg.mic_device.empty()) {
                 return std::unexpected(ares.error());
             }
-            std::cerr << "[vkcap-kms] Warning: audio disabled (" << ares.error() << ")\n";
+            std::cerr << "[vkcap] Warning: audio disabled (" << ares.error() << ")\n";
         } else {
             audio = std::move(*ares);
         }
@@ -197,8 +197,8 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
     }
 
     std::cerr << std::format(
-        "[vkcap-kms] Recording {} ({} {}x{}@{:.1f}Hz -> {}x{}, {}, CFR {}fps{})\n"
-        "[vkcap-kms] Color gamut: {} | Audio: {}\n",
+        "[vkcap] Recording {} ({} {}x{}@{:.1f}Hz -> {}x{}, {}, CFR {}fps{})\n"
+        "[vkcap] Color gamut: {} | Audio: {}\n",
         cfg.output_path, disp.connector_name, src_w, src_h, disp.refresh_hz, enc_w, enc_h,
         cfg.pixfmt == PixelFormat::P010 ? "AV1 10-bit P010" : "AV1 8-bit NV12",
         cfg.fps, cfg.capture_cursor ? ", hw-cursor" : "",
@@ -244,7 +244,7 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
                     ? (static_cast<double>(cst.total_compute_ns) / static_cast<double>(cst.frames_processed)) / 1e6
                     : 0.0;
                 std::cerr << std::format(
-                    "\r[vkcap-kms] {:.1f} fps | {} frames | {} dropped | {:.2f} Mbps | compute {:.2f} ms/f   ",
+                    "\r[vkcap] {:.1f} fps | {} frames | {} dropped | {:.2f} Mbps | compute {:.2f} ms/f   ",
                     inst_fps, est.frames_submitted, encode_queue.dropped(), mbps, avg_comp_ms)
                           << std::flush;
                 last_enc_frames = est.frames_submitted;
@@ -254,7 +254,7 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
     });
 
     // Stage 1: Precision clock-paced KMS grab + isolated low-priority GPU compute
-    pthread_setname_np(pthread_self(), "vkcap-kms");
+    pthread_setname_np(pthread_self(), "vkcap");
     ::prctl(PR_SET_TIMERSLACK, 1, 0, 0, 0);
     const int64_t frame_interval_ns = 1'000'000'000LL / std::max<uint32_t>(1u, cfg.fps);
     int64_t base_ns = monotonic_now_ns();
@@ -361,7 +361,7 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
         ? (static_cast<double>(cst.total_compute_ns) / static_cast<double>(cst.frames_processed)) / 1e6
         : 0.0;
     std::cerr << std::format(
-        "[vkcap-kms] Saved '{}' ({} frames, {:.1f}s, {:.1f} avg fps, {} dropped, {:.2f} MiB, compute {:.2f} ms/f)\n",
+        "[vkcap] Saved '{}' ({} frames, {:.1f}s, {:.1f} avg fps, {} dropped, {:.2f} MiB, compute {:.2f} ms/f)\n",
         cfg.output_path, est.frames_submitted, elapsed, avg_fps, encode_queue.dropped(),
         static_cast<double>(est.bytes_written) / (1024.0 * 1024.0), avg_comp_ms);
 

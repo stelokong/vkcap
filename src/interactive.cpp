@@ -313,7 +313,7 @@ bool prompt_resolution_and_output(std::istream &in, std::ostream &out,
 }
 
 std::string format_equiv_cli(const Config &cfg, const char *prog_name) {
-    std::string cmd = prog_name ? prog_name : "vkcap-kms";
+    std::string cmd = prog_name ? prog_name : "vkcap";
     if (!cfg.display.empty()) cmd += std::format(" -D {}", cfg.display);
     if (!cfg.profile.empty() && cfg.profile != "default") {
         cmd += std::format(" -p {}", cfg.profile);
@@ -363,7 +363,7 @@ std::expected<bool, std::string> run_interactive_setup(
     if (saved_res && saved_res->has_value()) {
         had_saved_defaults = true;
         const Config &saved = **saved_res;
-        out << "\n=== vkcap-kms Saved Defaults ===\n"
+        out << "\n=== vkcap Saved Defaults ===\n"
             << format_config_summary(saved) << '\n';
         bool use_saved = true;
         if (!prompt_yes_no(in, out, "Use your saved default settings and start recording? [Y/n]: ", true, use_saved)) {
@@ -386,7 +386,7 @@ std::expected<bool, std::string> run_interactive_setup(
         return std::unexpected("No connected active DRM/KMS displays found in /dev/dri/card*");
     }
 
-    out << "=== vkcap-kms Interactive Setup ===\n"
+    out << "=== vkcap Interactive Setup ===\n"
         << "Press Enter to accept any [default], or type 'q' to cancel.\n\n";
 
     // Choose Quick Setup (premade profile) vs Advanced Setup (every single setting)

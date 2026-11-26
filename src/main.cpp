@@ -97,7 +97,7 @@ int main(int argc, char **argv) {
 
     auto res = vkcap::run_kms_pipeline(cfg, g_stop);
     if (!res) {
-        std::cerr << "vkcap-kms failed: " << res.error() << '\n';
+        std::cerr << "vkcap failed: " << res.error() << '\n';
         return 1;
     }
     return 0;

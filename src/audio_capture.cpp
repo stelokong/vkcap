@@ -408,7 +408,7 @@ std::expected<std::unique_ptr<AudioCapture>, std::string> AudioCapture::start(co
             PW_KEY_STREAM_CAPTURE_SINK, "true",
             PW_KEY_NODE_LATENCY, "480/48000",
             nullptr);
-        auto r = connect_stream("vkcap-kms-system", props, impl->sys_stream);
+        auto r = connect_stream("vkcap-system", props, impl->sys_stream);
         if (!r) {
             pw_thread_loop_unlock(impl->loop);
             return std::unexpected(r.error());
@@ -425,7 +425,7 @@ std::expected<std::unique_ptr<AudioCapture>, std::string> AudioCapture::start(co
         if (!resolved_mic_target.empty()) {
             pw_properties_set(props, PW_KEY_TARGET_OBJECT, resolved_mic_target.c_str());
         }
-        auto r = connect_stream("vkcap-kms-mic", props, impl->mic_stream);
+        auto r = connect_stream("vkcap-mic", props, impl->mic_stream);
         if (!r) {
             pw_thread_loop_unlock(impl->loop);
             return std::unexpected(r.error());

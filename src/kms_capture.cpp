@@ -84,7 +84,7 @@ std::expected<KmsSurface, std::string> export_fb_to_surface_locked(int drm_fd, u
         if (e == EACCES || e == EPERM) {
             return std::unexpected(
                 "drmModeGetFB2 denied (CAP_SYS_ADMIN required). Run once:\n"
-                "  sudo setcap cap_sys_admin=p ./build/vkcap-kms");
+                "  sudo setcap cap_sys_admin=p ./build/vkcap");
         }
         return std::unexpected(std::format("DRM_IOCTL_MODE_GETFB2(fb={}) failed: {}", fb_id, std::strerror(e)));
     }
@@ -92,7 +92,7 @@ std::expected<KmsSurface, std::string> export_fb_to_surface_locked(int drm_fd, u
     if (fb2.handles[0] == 0) {
         return std::unexpected(
             "drmModeGetFB2 returned null GEM handle (CAP_SYS_ADMIN required). Run once:\n"
-            "  sudo setcap cap_sys_admin=p ./build/vkcap-kms");
+            "  sudo setcap cap_sys_admin=p ./build/vkcap");
     }
 
     KmsSurface surf{};

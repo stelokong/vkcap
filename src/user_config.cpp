@@ -114,12 +114,12 @@ std::string extract_ext(const std::string &path) {
 
 std::filesystem::path user_defaults_path() {
     if (const char *xdg = std::getenv("XDG_CONFIG_HOME"); xdg && xdg[0] != '\0') {
-        return std::filesystem::path(xdg) / "vkcap-kms" / "defaults.conf";
+        return std::filesystem::path(xdg) / "vkcap" / "defaults.conf";
     }
     if (const char *home = std::getenv("HOME"); home && home[0] != '\0') {
-        return std::filesystem::path(home) / ".config" / "vkcap-kms" / "defaults.conf";
+        return std::filesystem::path(home) / ".config" / "vkcap" / "defaults.conf";
     }
-    return std::filesystem::path(".vkcap-kms-defaults.conf");
+    return std::filesystem::path(".vkcap-defaults.conf");
 }
 
 std::expected<std::optional<Config>, std::string> load_user_defaults(const std::filesystem::path &path) {
@@ -230,7 +230,7 @@ std::expected<void, std::string> save_user_defaults(const Config &cfg, const std
         return std::unexpected(std::format("Failed to write user defaults to '{}'", path.string()));
     }
 
-    out << "# vkcap-kms personal default settings (independent of built-in profiles)\n";
+    out << "# vkcap personal default settings (independent of built-in profiles)\n";
     out << "display=" << cfg.display << '\n';
     out << "profile=" << cfg.profile << '\n';
     out << "container_ext=" << extract_ext(cfg.output_path) << '\n';

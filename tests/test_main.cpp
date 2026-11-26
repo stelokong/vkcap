@@ -40,7 +40,7 @@ void test_cli_and_privileges() {
     (void)init_least_privilege();
 
     const char *argv[] = {
-        "vkcap-kms", "-D", "DP-1", "-o", "out.mp4", "-f", "120", "-s", "2560x1440",
+        "vkcap", "-D", "DP-1", "-o", "out.mp4", "-f", "120", "-s", "2560x1440",
         "--pixfmt", "p010", "--rc", "vbr", "-b", "35M", "--no-cursor"
     };
     auto cfg = parse_args(static_cast<int>(std::size(argv)), const_cast<char **>(argv));
@@ -68,7 +68,7 @@ void test_cli_and_privileges() {
 
     // Verify explicit flags override profile settings regardless of flag order
     {
-        const char *argv_p[] = {"vkcap-kms", "-f", "240", "-p", "gameplay-10bit", "-o", "over.mkv"};
+        const char *argv_p[] = {"vkcap", "-f", "240", "-p", "gameplay-10bit", "-o", "over.mkv"};
         auto c = parse_args(static_cast<int>(std::size(argv_p)), const_cast<char **>(argv_p));
         check(c.has_value(), "profile + override parses");
         check(c->profile == "gameplay-10bit", "profile gameplay-10bit");
@@ -80,17 +80,17 @@ void test_cli_and_privileges() {
 
     // Verify audio CLI defaults and overrides
     {
-        const char *argv_def[] = {"vkcap-kms", "-o", "def.mkv"};
+        const char *argv_def[] = {"vkcap", "-o", "def.mkv"};
         auto c = parse_args(static_cast<int>(std::size(argv_def)), const_cast<char **>(argv_def));
         check(c.has_value(), "default audio flags");
         check(c->audio && c->capture_system_audio && !c->capture_mic, "system audio ON, mic OFF by default");
 
-        const char *argv_ns[] = {"vkcap-kms", "--no-sound", "-o", "ns.mkv"};
+        const char *argv_ns[] = {"vkcap", "--no-sound", "-o", "ns.mkv"};
         auto c2 = parse_args(static_cast<int>(std::size(argv_ns)), const_cast<char **>(argv_ns));
         check(c2.has_value() && !c2->audio && !c2->capture_system_audio && !c2->capture_mic, "--no-sound disables audio");
 
         const char *argv_mic[] = {
-            "vkcap-kms", "--mic", "alsa_input.usb-test",
+            "vkcap", "--mic", "alsa_input.usb-test",
             "--system-volume", "85%", "--mic-volume", "200",
             "--audio-codec", "flac", "--audio-bitrate", "256k", "-o", "m.mkv"
         };
@@ -105,7 +105,7 @@ void test_cli_and_privileges() {
 
     // Verify overhauled interactive wizard: Quick Setup + Save Defaults -> Instant Saved Start -> Decline -> Advanced Setup (don't overwrite)
     if (!disps->empty()) {
-        const std::filesystem::path tmp_conf = "/tmp/vkcap_kms_test_defaults.conf";
+        const std::filesystem::path tmp_conf = "/tmp/vkcap_test_defaults.conf";
         std::filesystem::remove(tmp_conf);
 
         // 1) Quick setup with custom volumes (80% sys, 200% mic) + save as personal defaults
@@ -120,7 +120,7 @@ void test_cli_and_privileges() {
                                  "200%\nn\n1920x1080\nwiz_out.mp4\ny\n";
             std::istringstream in(script);
             std::ostringstream out;
-            auto w = run_interactive_setup(ic, "vkcap-kms", in, out, tmp_conf);
+            auto w = run_interactive_setup(ic, "vkcap", in, out, tmp_conf);
             check(w.has_value() && *w, "quick wizard confirmed");
             check(ic.display == (*disps)[0].connector_name, "quick display 1");
             check(ic.profile == "gameplay" && ic.fps == 120, "quick profile gameplay 120fps");
@@ -138,7 +138,7 @@ void test_cli_and_privileges() {
             Config ic2;
             std::istringstream in("y\n");
             std::ostringstream out;
-            auto w2 = run_interactive_setup(ic2, "vkcap-kms", in, out, tmp_conf);
+            auto w2 = run_interactive_setup(ic2, "vkcap", in, out, tmp_conf);
             check(w2.has_value() && *w2, "saved defaults accepted immediately");
             check(ic2.fps == 120 && std::abs(ic2.mic_volume_pct - 200.0) < 1e-6, "saved defaults loaded accurately");
             check(ic2.output_path.ends_with(".mp4") && ic2.output_path != "wiz_out.mp4", "fresh timestamped .mp4 filename");
@@ -158,7 +158,7 @@ void test_cli_and_privileges() {
                 "180\n4\n1\n0\n6\n3\n1\n2\n"
                 "y\n125\nn\n3\nnative\nadv.mkv\nn\n");
             std::ostringstream out;
-            auto w3 = run_interactive_setup(ic3, "vkcap-kms", in, out, tmp_conf);
+            auto w3 = run_interactive_setup(ic3, "vkcap", in, out, tmp_conf);
             check(w3.has_value() && *w3, "advanced wizard confirmed");
             check(ic3.codec == Codec::Hevc && ic3.pixfmt == PixelFormat::P010, "advanced codec/pixfmt");
             check(ic3.fps == 90 && ic3.duration_sec == 10.0, "advanced fps/duration");
@@ -180,7 +180,7 @@ void test_cli_and_privileges() {
             Config ic_cancel;
             std::istringstream in_q("q\n");
             std::ostringstream out_q;
-            auto wq = run_interactive_setup(ic_cancel, "vkcap-kms", in_q, out_q, tmp_conf);
+            auto wq = run_interactive_setup(ic_cancel, "vkcap", in_q, out_q, tmp_conf);
             check(wq.has_value() && !*wq, "interactive wizard cancel via 'q'");
         }
 
@@ -189,16 +189,16 @@ void test_cli_and_privileges() {
 
     // Verify codec-specific QP range validation (0..255 for AV1, 0..51 for HEVC/H264)
     {
-        const char *bad_hevc[] = {"vkcap-kms", "--codec", "hevc", "--qp", "80", "-o", "x.mkv"};
+        const char *bad_hevc[] = {"vkcap", "--codec", "hevc", "--qp", "80", "-o", "x.mkv"};
         check(!parse_args(static_cast<int>(std::size(bad_hevc)), const_cast<char **>(bad_hevc)).has_value(),
               "reject --qp 80 for hevc");
-        const char *bad_h264[] = {"vkcap-kms", "--qp", "52", "--codec", "h264", "-o", "x.mkv"};
+        const char *bad_h264[] = {"vkcap", "--qp", "52", "--codec", "h264", "-o", "x.mkv"};
         check(!parse_args(static_cast<int>(std::size(bad_h264)), const_cast<char **>(bad_h264)).has_value(),
               "reject --qp 52 for h264 regardless of arg order");
-        const char *ok_hevc[] = {"vkcap-kms", "--codec", "hevc", "--qp", "51", "-o", "x.mkv"};
+        const char *ok_hevc[] = {"vkcap", "--codec", "hevc", "--qp", "51", "-o", "x.mkv"};
         check(parse_args(static_cast<int>(std::size(ok_hevc)), const_cast<char **>(ok_hevc)).has_value(),
               "accept --qp 51 for hevc");
-        const char *ok_av1[] = {"vkcap-kms", "--codec", "av1", "--qp", "120", "-o", "x.mkv"};
+        const char *ok_av1[] = {"vkcap", "--codec", "av1", "--qp", "120", "-o", "x.mkv"};
         check(parse_args(static_cast<int>(std::size(ok_av1)), const_cast<char **>(ok_av1)).has_value(),
               "accept --qp 120 for av1");
     }
@@ -294,7 +294,7 @@ void test_kms_gpu_pipeline(PixelFormat pixfmt,
                            bool with_wide_gamut = false,
                            bool with_audio = false) {
     const std::string out_path = std::format(
-        "/tmp/vkcap_kms_test_{}_{}x{}_{}{}{}.{}",
+        "/tmp/vkcap_test_{}_{}x{}_{}{}{}.{}",
         pixfmt == PixelFormat::P010 ? "p010" : "nv12",
         dst_w, dst_h, with_cursor ? "cur" : "nocur",
         with_wide_gamut ? "_wg" : "", with_audio ? "_av" : "", ext);

@@ -192,7 +192,7 @@ std::string default_output_filename(std::string_view ext) {
     std::tm tm{};
     localtime_r(&now, &tm);
     char buf[64];
-    std::strftime(buf, sizeof(buf), "vkcap_kms_%Y%m%d_%H%M%S", &tm);
+    std::strftime(buf, sizeof(buf), "vkcap_%Y%m%d_%H%M%S", &tm);
     std::string out(buf);
     if (ext.empty()) {
         out += ".mkv";
@@ -254,8 +254,8 @@ std::expected<std::pair<uint32_t, uint32_t>, std::string> parse_resolution(const
 
 void print_help(const char *prog_name) {
     std::cout <<
-R"(vkcap-kms — Zero-copy Linux DRM/KMS -> Vulkan Compute -> Vulkan Video (AV1) screen recorder
-            Compositor-independent, least-privilege (requires only cap_sys_admin=p).
+R"(vkcap — Zero-copy Linux DRM/KMS -> Vulkan Compute -> Vulkan Video (AV1) screen recorder
+        Compositor-independent, least-privilege (requires only cap_sys_admin=p).
 
 Usage: )" << prog_name << R"( [OPTIONS]
        Run with no arguments in a terminal to launch the interactive setup prompt.
@@ -268,7 +268,7 @@ Profiles & Interactive Mode:
 Display Selection & Capture:
   -l, --list-displays         List connected DRM/KMS displays and exit (no privileges needed)
   -D, --display <name|idx>    Select display by connector (e.g. DP-1, HDMI-A-1) or index [default: auto]
-  -o, --output <path>         Output file (.mkv, .mp4, .webm, .ivf) [default: vkcap_kms_<ts>.mkv]
+  -o, --output <path>         Output file (.mkv, .mp4, .webm, .ivf) [default: vkcap_<ts>.mkv]
   -f, --fps <n>               Locked CFR capture framerate [default: 60]
   -s, --scale <WxH>           Scale output via GPU Catmull-Rom bicubic filter (even WxH)
   -d, --duration <sec>        Stop recording automatically after <sec> seconds
@@ -310,7 +310,7 @@ Color & Diagnostics:
   -h, --help                  Show this help
 
 Least-Privilege Setup (run once after building):
-  sudo setcap cap_sys_admin=p ./build/vkcap-kms
+  sudo setcap cap_sys_admin=p ./build/vkcap
 )";
 }
 
