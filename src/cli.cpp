@@ -530,6 +530,7 @@ std::expected<Config, std::string> parse_args(int argc, char **argv) {
                 auto r = parse_enum<Codec>(optarg, {{"av1", Codec::Av1}, {"hevc", Codec::Hevc}, {"h264", Codec::H264}}, "--codec");
                 if (!r) return std::unexpected(r.error());
                 cfg.codec = *r;
+                cfg.codec_explicit = true;
                 break;
             }
             case OPT_PIXFMT: {
@@ -611,6 +612,7 @@ std::expected<Config, std::string> parse_args(int argc, char **argv) {
                 auto r = parse_int(optarg, 0, 16, "--device");
                 if (!r) return std::unexpected(r.error());
                 cfg.device_index = static_cast<uint32_t>(*r);
+                cfg.device_explicit = true;
                 break;
             }
             case OPT_COLOR_RANGE: {

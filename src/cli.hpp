@@ -46,12 +46,13 @@ struct Config {
     int64_t audio_bitrate = 192'000;   // Opus/AAC bitrate in bps (default 192k)
 
     Codec codec = Codec::Av1;
+    bool codec_explicit = false;  // True if user explicitly passed --codec
     PixelFormat pixfmt = PixelFormat::Nv12;
     RateControl rc = RateControl::Auto;
     int qp = -1;              // -1 = codec-aware default (52 for AV1, 22 for HEVC/H264)
     int64_t bitrate = 0;      // bps; 0 = unset
     int64_t max_bitrate = 0;  // bps; 0 = unset
-    int quality = -1;         // -1 = RDNA 4 auto default (1)
+    int quality = -1;         // -1 = auto default (clamped to GPU maxQualityLevels)
     Tune tune = Tune::Hq;
     Usage usage = Usage::Record;
     Content content = Content::Rendered;
@@ -59,6 +60,7 @@ struct Config {
     int async_depth = 4;
     int b_depth = 1;
     uint32_t device_index = 0;
+    bool device_explicit = false;  // True if user explicitly passed --device
 
     ColorRange color_range = ColorRange::Limited;
     ColorSpace color_space = ColorSpace::Bt709;

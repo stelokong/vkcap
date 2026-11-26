@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
@@ -12,9 +13,11 @@
 #include <iostream>
 #include <libdrm/drm_fourcc.h>
 #include <linux/dma-buf.h>
+#include <mutex>
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #include <vector>
 
@@ -90,7 +93,8 @@ struct CachedSrcImage {
 struct CachedDstAlias {
     VkImage key_img = VK_NULL_HANDLE;
     VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory mem = VK_NULL_HANDLE;
+    std::array<VkDeviceMemory, 2> mem{};
+    uint32_t num_mems = 0;
     VkImageView y_view = VK_NULL_HANDLE;
     VkImageView uv_view = VK_NULL_HANDLE;
     bool initialized_layout = false;
@@ -103,7 +107,71 @@ struct CmdSlot {
     VkSemaphore ext_wait_sem = VK_NULL_HANDLE;
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     VkDescriptorSet desc_set = VK_NULL_HANDLE;
+    std::mutex mtx;
+    bool in_flight = false;
+    std::chrono::steady_clock::time_point submit_t0{};
 };
+
+// Matches a DRM /dev/dri/card* node to its Vulkan physical device index via VK_EXT_physical_device_drm.
+// Falls back to default_idx if matching is unavailable or --device was explicitly specified.
+uint32_t resolve_vulkan_device_index(uint32_t default_idx, bool explicit_dev, std::string_view drm_card_path) {
+    if (explicit_dev || drm_card_path.empty()) return default_idx;
+
+    struct stat st{};
+    std::string path_str(drm_card_path);
+    if (::stat(path_str.c_str(), &st) != 0) return default_idx;
+    const int64_t want_major = static_cast<int64_t>(major(st.st_rdev));
+    const int64_t want_minor = static_cast<int64_t>(minor(st.st_rdev));
+
+    VkApplicationInfo app{};
+    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.apiVersion = VK_API_VERSION_1_3;
+    VkInstanceCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    ici.pApplicationInfo = &app;
+
+    VkInstance tmp_inst = VK_NULL_HANDLE;
+    if (vkCreateInstance(&ici, nullptr, &tmp_inst) != VK_SUCCESS || !tmp_inst) {
+        return default_idx;
+    }
+
+    uint32_t matched_idx = default_idx;
+    uint32_t dev_count = 0;
+    if (vkEnumeratePhysicalDevices(tmp_inst, &dev_count, nullptr) == VK_SUCCESS && dev_count > 0) {
+        std::vector<VkPhysicalDevice> devs(dev_count);
+        if (vkEnumeratePhysicalDevices(tmp_inst, &dev_count, devs.data()) == VK_SUCCESS) {
+            for (uint32_t i = 0; i < dev_count; ++i) {
+                uint32_t ext_cnt = 0;
+                vkEnumerateDeviceExtensionProperties(devs[i], nullptr, &ext_cnt, nullptr);
+                std::vector<VkExtensionProperties> exts(ext_cnt);
+                vkEnumerateDeviceExtensionProperties(devs[i], nullptr, &ext_cnt, exts.data());
+                bool has_drm = false;
+                for (const auto &e : exts) {
+                    if (std::strcmp(e.extensionName, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME) == 0) {
+                        has_drm = true;
+                        break;
+                    }
+                }
+                if (!has_drm) continue;
+
+                VkPhysicalDeviceDrmPropertiesEXT drm_props{};
+                drm_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT;
+                VkPhysicalDeviceProperties2 props2{};
+                props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+                props2.pNext = &drm_props;
+                vkGetPhysicalDeviceProperties2(devs[i], &props2);
+
+                if ((drm_props.hasPrimary && drm_props.primaryMajor == want_major && drm_props.primaryMinor == want_minor) ||
+                    (drm_props.hasRender && drm_props.renderMajor == want_major && drm_props.renderMinor == want_minor)) {
+                    matched_idx = i;
+                    break;
+                }
+            }
+        }
+    }
+    vkDestroyInstance(tmp_inst, nullptr);
+    return matched_idx;
+}
 
 }  // namespace
 
@@ -127,6 +195,8 @@ struct VulkanCompute::Impl {
     PFN_vkGetPhysicalDeviceFormatProperties2 pfn_get_fmt_props2 = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties2 pfn_get_img_fmt_props2 = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties pfn_get_mem_props = nullptr;
+    PFN_vkGetPhysicalDeviceProperties2 pfn_get_phys_props2 = nullptr;
+    PFN_vkGetPhysicalDeviceFeatures2 pfn_get_phys_feats2 = nullptr;
     PFN_vkGetMemoryFdKHR pfn_ff_get_mem_fd = nullptr;
     PFN_vkGetSemaphoreCounterValue pfn_ff_get_sem_val = nullptr;
     PFN_vkWaitSemaphores pfn_ff_wait_sems = nullptr;
@@ -151,6 +221,8 @@ struct VulkanCompute::Impl {
     PFN_vkDestroyPipelineLayout pfn_destroy_pl = nullptr;
     PFN_vkCreateComputePipelines pfn_create_comp_pipe = nullptr;
     PFN_vkDestroyPipeline pfn_destroy_pipe = nullptr;
+    PFN_vkCreatePipelineCache pfn_create_pipe_cache = nullptr;
+    PFN_vkDestroyPipelineCache pfn_destroy_pipe_cache = nullptr;
     PFN_vkCreateDescriptorPool pfn_create_dp = nullptr;
     PFN_vkDestroyDescriptorPool pfn_destroy_dp = nullptr;
     PFN_vkAllocateDescriptorSets pfn_alloc_ds = nullptr;
@@ -187,12 +259,15 @@ struct VulkanCompute::Impl {
     PFN_vkGetImageDrmFormatModifierPropertiesEXT pfn_get_img_drm_mod = nullptr;
 
     bool compute_has_video_enc_ext = false;
+    bool compute_has_video_maint1 = false;
     bool use_push_descriptors = false;
 
     VkSampler linear_sampler = VK_NULL_HANDLE;
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     VkPipelineLayout pipe_layout = VK_NULL_HANDLE;
-    // Specialized pipelines: [exact1To1 ? 1 : 0][hasCursor ? 1 : 0]
+    VkShaderModule shader_mod = VK_NULL_HANDLE;
+    VkPipelineCache pipe_cache = VK_NULL_HANDLE;
+    // Lazily compiled specialized pipelines: [exact1To1 ? 1 : 0][hasCursor ? 1 : 0]
     VkPipeline pipes[2][2]{};
 
     // 1x1 transparent dummy cursor image so binding 1 is always valid
@@ -207,11 +282,14 @@ struct VulkanCompute::Impl {
     std::vector<CachedSrcImage> src_cache;
     std::vector<CachedDstAlias> dst_alias_cache;
     std::array<AVFrame *, 8> probe_shells{};
+    std::mutex shell_mtx;
+    std::vector<AVFrame *> recycled_shells;
 
     uint32_t out_width = 0;
     uint32_t out_height = 0;
     PushConstants base_pc{};
-    ComputeStats stats{};
+    std::atomic<uint64_t> stat_frames_processed{0};
+    std::atomic<uint64_t> stat_total_compute_ns{0};
 
     template <typename T>
     T load_inst(const char *name) const {
@@ -246,11 +324,52 @@ struct VulkanCompute::Impl {
         if (d.y_view) pfn_destroy_img_view(compute_dev, d.y_view, nullptr);
         if (d.uv_view) pfn_destroy_img_view(compute_dev, d.uv_view, nullptr);
         if (d.image) pfn_destroy_image(compute_dev, d.image, nullptr);
-        if (d.mem) pfn_free_mem(compute_dev, d.mem, nullptr);
+        for (uint32_t i = 0; i < d.num_mems; ++i) {
+            if (d.mem[i]) pfn_free_mem(compute_dev, d.mem[i], nullptr);
+        }
         d = {};
     }
 
+    void wait_slot_impl(size_t idx) noexcept {
+        if (idx >= kNumSlots) return;
+        CmdSlot &sl = slots[idx];
+        std::lock_guard lk(sl.mtx);
+        if (!sl.in_flight) return;
+        pfn_wait_fences(compute_dev, 1, &sl.fence, VK_TRUE, UINT64_MAX);
+        const auto t1 = std::chrono::steady_clock::now();
+        stat_frames_processed.fetch_add(1, std::memory_order_relaxed);
+        stat_total_compute_ns.fetch_add(
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - sl.submit_t0).count()),
+            std::memory_order_relaxed);
+        sl.in_flight = false;
+    }
+
+    AVFrame *acquire_shell() noexcept {
+        {
+            std::lock_guard lk(shell_mtx);
+            if (!recycled_shells.empty()) {
+                AVFrame *f = recycled_shells.back();
+                recycled_shells.pop_back();
+                return f;
+            }
+        }
+        return av_frame_alloc();
+    }
+
+    void recycle_shell(AVFrame *&frame) noexcept {
+        if (!frame) return;
+        av_frame_unref(frame);
+        std::lock_guard lk(shell_mtx);
+        if (recycled_shells.size() < 16) {
+            recycled_shells.push_back(frame);
+            frame = nullptr;
+            return;
+        }
+        av_frame_free(&frame);
+    }
+
     void clear_caches() {
+        for (size_t i = 0; i < kNumSlots; ++i) wait_slot_impl(i);
         if (pfn_device_wait_idle && compute_dev) {
             pfn_device_wait_idle(compute_dev);
         }
@@ -263,6 +382,13 @@ struct VulkanCompute::Impl {
     ~Impl() {
         for (auto *&f : probe_shells) {
             if (f) av_frame_free(&f);
+        }
+        {
+            std::lock_guard lk(shell_mtx);
+            for (auto *&f : recycled_shells) {
+                if (f) av_frame_free(&f);
+            }
+            recycled_shells.clear();
         }
         if (!compute_dev) {
             av_buffer_unref(&hw_frames_ref);
@@ -283,6 +409,8 @@ struct VulkanCompute::Impl {
                 if (pipes[i][j]) pfn_destroy_pipe(compute_dev, pipes[i][j], nullptr);
             }
         }
+        if (pipe_cache) pfn_destroy_pipe_cache(compute_dev, pipe_cache, nullptr);
+        if (shader_mod) pfn_destroy_shader(compute_dev, shader_mod, nullptr);
         if (pipe_layout) pfn_destroy_pl(compute_dev, pipe_layout, nullptr);
         if (dsl) pfn_destroy_dsl(compute_dev, dsl, nullptr);
         if (linear_sampler) pfn_destroy_sampler(compute_dev, linear_sampler, nullptr);
@@ -364,6 +492,20 @@ struct VulkanCompute::Impl {
         pfn_get_fmt_props2 = load_inst<PFN_vkGetPhysicalDeviceFormatProperties2>("vkGetPhysicalDeviceFormatProperties2");
         pfn_get_img_fmt_props2 = load_inst<PFN_vkGetPhysicalDeviceImageFormatProperties2>("vkGetPhysicalDeviceImageFormatProperties2");
         pfn_get_mem_props = load_inst<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties");
+        pfn_get_phys_props2 = load_inst<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2");
+        pfn_get_phys_feats2 = load_inst<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2");
+
+        if (pfn_get_phys_props2) {
+            VkPhysicalDeviceSubgroupProperties sg_props{};
+            sg_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+            VkPhysicalDeviceProperties2 p2{};
+            p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            p2.pNext = &sg_props;
+            pfn_get_phys_props2(vkctx->phys_dev, &p2);
+            if ((sg_props.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT) == 0) {
+                return std::unexpected("GPU does not support Vulkan subgroupShuffleUp (VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT)");
+            }
+        }
 
         pfn_ff_get_mem_fd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(pfn_get_dev_proc(vkctx->act_dev, "vkGetMemoryFdKHR"));
         pfn_ff_get_sem_val = reinterpret_cast<PFN_vkGetSemaphoreCounterValue>(pfn_get_dev_proc(vkctx->act_dev, "vkGetSemaphoreCounterValue"));
@@ -410,17 +552,26 @@ struct VulkanCompute::Impl {
             VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
             VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
         };
+        VkPhysicalDeviceVideoMaintenance1FeaturesKHR vm1_feat{};
+        vm1_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_1_FEATURES_KHR;
         if (has_ext(VK_KHR_VIDEO_QUEUE_EXTENSION_NAME) &&
             has_ext(VK_KHR_VIDEO_ENCODE_QUEUE_EXTENSION_NAME)) {
             req_exts.push_back(VK_KHR_VIDEO_QUEUE_EXTENSION_NAME);
             req_exts.push_back(VK_KHR_VIDEO_ENCODE_QUEUE_EXTENSION_NAME);
-            if (has_ext(VK_KHR_VIDEO_MAINTENANCE_1_EXTENSION_NAME)) {
-                req_exts.push_back(VK_KHR_VIDEO_MAINTENANCE_1_EXTENSION_NAME);
-            }
             compute_has_video_enc_ext = true;
-        }
-        if (has_ext(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME)) {
-            req_exts.push_back(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
+            if (has_ext(VK_KHR_VIDEO_MAINTENANCE_1_EXTENSION_NAME) && pfn_get_phys_feats2) {
+                VkPhysicalDeviceVideoMaintenance1FeaturesKHR vm1_query{};
+                vm1_query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_1_FEATURES_KHR;
+                VkPhysicalDeviceFeatures2 feats2{};
+                feats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                feats2.pNext = &vm1_query;
+                pfn_get_phys_feats2(vkctx->phys_dev, &feats2);
+                if (vm1_query.videoMaintenance1 == VK_TRUE) {
+                    req_exts.push_back(VK_KHR_VIDEO_MAINTENANCE_1_EXTENSION_NAME);
+                    vm1_feat.videoMaintenance1 = VK_TRUE;
+                    compute_has_video_maint1 = true;
+                }
+            }
         }
         if (has_ext(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) {
             req_exts.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
@@ -445,6 +596,7 @@ struct VulkanCompute::Impl {
 
         VkPhysicalDeviceVulkan13Features f13{};
         f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+        f13.pNext = compute_has_video_maint1 ? &vm1_feat : nullptr;
         f13.synchronization2 = VK_TRUE;
 
         VkPhysicalDeviceVulkan12Features f12{};
@@ -493,6 +645,8 @@ struct VulkanCompute::Impl {
         pfn_destroy_pl = load_dev<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
         pfn_create_comp_pipe = load_dev<PFN_vkCreateComputePipelines>("vkCreateComputePipelines");
         pfn_destroy_pipe = load_dev<PFN_vkDestroyPipeline>("vkDestroyPipeline");
+        pfn_create_pipe_cache = load_dev<PFN_vkCreatePipelineCache>("vkCreatePipelineCache");
+        pfn_destroy_pipe_cache = load_dev<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache");
         pfn_create_dp = load_dev<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool");
         pfn_destroy_dp = load_dev<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool");
         pfn_alloc_ds = load_dev<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets");
@@ -572,74 +726,34 @@ struct VulkanCompute::Impl {
             return std::unexpected("Failed to create pipeline layout");
         }
 
-        // Compile 4 specialized compute pipelines for the configured pixel format & dither mode:
-        // pipes[exact1To1 ? 1 : 0][hasCursor ? 1 : 0] — dead branches removed from RDNA 4 ISA.
+        // Keep shader module + pipeline cache so specialized pipelines are compiled lazily
+        // (typically only 1 variant for --no-cursor or 1-2 variants with cursor, instead of all 4).
         const bool is_p010 = (cfg.pixfmt == PixelFormat::P010);
         const uint32_t *spv_words = is_p010 ? kRgbToYuvP010Spv.data() : kRgbToYuvNv12Spv.data();
         const size_t spv_count = is_p010 ? kRgbToYuvP010Spv.size() : kRgbToYuvNv12Spv.size();
 
         VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0,
                                       spv_count * sizeof(uint32_t), spv_words};
-        VkShaderModule sm = VK_NULL_HANDLE;
-        if (pfn_create_shader(compute_dev, &smci, nullptr, &sm) != VK_SUCCESS) {
+        if (pfn_create_shader(compute_dev, &smci, nullptr, &shader_mod) != VK_SUCCESS) {
             return std::unexpected("Failed to create Vulkan compute shader module");
         }
-
-        struct SpecData {
-            VkBool32 exact1To1;
-            VkBool32 hasCursor;
-            VkBool32 enableDither;
-            VkBool32 convertGamut;
-            float gm[9];
-        };
-        constexpr std::array<VkSpecializationMapEntry, 13> spec_entries = {{
-            {0,  offsetof(SpecData, exact1To1),    sizeof(VkBool32)},
-            {1,  offsetof(SpecData, hasCursor),    sizeof(VkBool32)},
-            {2,  offsetof(SpecData, enableDither), sizeof(VkBool32)},
-            {3,  offsetof(SpecData, convertGamut), sizeof(VkBool32)},
-            {4,  offsetof(SpecData, gm[0]),        sizeof(float)},
-            {5,  offsetof(SpecData, gm[1]),        sizeof(float)},
-            {6,  offsetof(SpecData, gm[2]),        sizeof(float)},
-            {7,  offsetof(SpecData, gm[3]),        sizeof(float)},
-            {8,  offsetof(SpecData, gm[4]),        sizeof(float)},
-            {9,  offsetof(SpecData, gm[5]),        sizeof(float)},
-            {10, offsetof(SpecData, gm[6]),        sizeof(float)},
-            {11, offsetof(SpecData, gm[7]),        sizeof(float)},
-            {12, offsetof(SpecData, gm[8]),        sizeof(float)},
-        }};
-
-        std::array<SpecData, 4> spec_datas{};
-        std::array<VkSpecializationInfo, 4> spec_infos{};
-        std::array<VkComputePipelineCreateInfo, 4> cpcis{};
-        for (int e = 0; e < 2; ++e) {
-            for (int c = 0; c < 2; ++c) {
-                const size_t idx = static_cast<size_t>(e * 2 + c);
-                spec_datas[idx].exact1To1 = e ? VK_TRUE : VK_FALSE;
-                spec_datas[idx].hasCursor = c ? VK_TRUE : VK_FALSE;
-                spec_datas[idx].enableDither = cfg.dither ? VK_TRUE : VK_FALSE;
-                spec_datas[idx].convertGamut = convert_gamut ? VK_TRUE : VK_FALSE;
-                for (size_t k = 0; k < 9; ++k) spec_datas[idx].gm[k] = gamut_matrix[k];
-                spec_infos[idx] = {static_cast<uint32_t>(spec_entries.size()), spec_entries.data(),
-                                   sizeof(SpecData), &spec_datas[idx]};
-                cpcis[idx].sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-                cpcis[idx].stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
-                                    VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", &spec_infos[idx]};
-                cpcis[idx].layout = pipe_layout;
-            }
-        }
-        std::array<VkPipeline, 4> created_pipes{};
-        VkResult pr = pfn_create_comp_pipe(compute_dev, VK_NULL_HANDLE, 4, cpcis.data(), nullptr, created_pipes.data());
-        pfn_destroy_shader(compute_dev, sm, nullptr);
-        if (pr != VK_SUCCESS) {
-            return std::unexpected("Failed to create specialized Vulkan RGB->YUV compute pipelines");
-        }
-        pipes[0][0] = created_pipes[0];
-        pipes[0][1] = created_pipes[1];
-        pipes[1][0] = created_pipes[2];
-        pipes[1][1] = created_pipes[3];
+        VkPipelineCacheCreateInfo pcci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, 0, nullptr};
+        (void)pfn_create_pipe_cache(compute_dev, &pcci, nullptr, &pipe_cache);
 
         src_cache.reserve(kMaxCachedSurfaces);
         dst_alias_cache.reserve(32);
+        recycled_shells.reserve(16);
+
+        // Pre-compile the expected 1:1 (or scaled) pipeline variant(s) at startup so frame 0 has zero compile stall
+        const bool likely_1to1 = (cfg.out_width == 0 && cfg.out_height == 0);
+        if (auto p = get_or_create_pipeline(likely_1to1, false); !p) {
+            return std::unexpected(p.error());
+        }
+        if (cfg.capture_cursor) {
+            if (auto p = get_or_create_pipeline(likely_1to1, true); !p) {
+                return std::unexpected(p.error());
+            }
+        }
 
         for (auto &sl : slots) {
             VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr,
@@ -681,14 +795,74 @@ struct VulkanCompute::Impl {
         return init_dummy_cursor();
     }
 
+    std::expected<VkPipeline, std::string> get_or_create_pipeline(bool exact_1to1, bool has_cursor) {
+        VkPipeline &slot = pipes[exact_1to1 ? 1 : 0][has_cursor ? 1 : 0];
+        if (slot != VK_NULL_HANDLE) return slot;
+
+        struct SpecData {
+            VkBool32 exact1To1;
+            VkBool32 hasCursor;
+            VkBool32 enableDither;
+            VkBool32 convertGamut;
+            float gm[9];
+        };
+        constexpr std::array<VkSpecializationMapEntry, 13> spec_entries = {{
+            {0,  offsetof(SpecData, exact1To1),    sizeof(VkBool32)},
+            {1,  offsetof(SpecData, hasCursor),    sizeof(VkBool32)},
+            {2,  offsetof(SpecData, enableDither), sizeof(VkBool32)},
+            {3,  offsetof(SpecData, convertGamut), sizeof(VkBool32)},
+            {4,  offsetof(SpecData, gm[0]),        sizeof(float)},
+            {5,  offsetof(SpecData, gm[1]),        sizeof(float)},
+            {6,  offsetof(SpecData, gm[2]),        sizeof(float)},
+            {7,  offsetof(SpecData, gm[3]),        sizeof(float)},
+            {8,  offsetof(SpecData, gm[4]),        sizeof(float)},
+            {9,  offsetof(SpecData, gm[5]),        sizeof(float)},
+            {10, offsetof(SpecData, gm[6]),        sizeof(float)},
+            {11, offsetof(SpecData, gm[7]),        sizeof(float)},
+            {12, offsetof(SpecData, gm[8]),        sizeof(float)},
+        }};
+
+        SpecData sd{};
+        sd.exact1To1 = exact_1to1 ? VK_TRUE : VK_FALSE;
+        sd.hasCursor = has_cursor ? VK_TRUE : VK_FALSE;
+        sd.enableDither = cfg.dither ? VK_TRUE : VK_FALSE;
+        sd.convertGamut = convert_gamut ? VK_TRUE : VK_FALSE;
+        for (size_t k = 0; k < 9; ++k) sd.gm[k] = gamut_matrix[k];
+
+        VkSpecializationInfo sinfo{static_cast<uint32_t>(spec_entries.size()), spec_entries.data(),
+                                   sizeof(SpecData), &sd};
+        VkComputePipelineCreateInfo cpci{};
+        cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                      VK_SHADER_STAGE_COMPUTE_BIT, shader_mod, "main", &sinfo};
+        cpci.layout = pipe_layout;
+
+        if (pfn_create_comp_pipe(compute_dev, pipe_cache, 1, &cpci, nullptr, &slot) != VK_SUCCESS) {
+            slot = VK_NULL_HANDLE;
+            return std::unexpected("Failed to create specialized Vulkan RGB->YUV compute pipeline");
+        }
+        return slot;
+    }
+
     std::expected<CachedSrcImage, std::string> import_dmabuf(const KmsSurface &surf) {
         const DrmFormatMapping *fm = find_drm_format(surf.drm_fourcc);
         if (!fm) {
             return std::unexpected(std::format("Unsupported DRM fourcc 0x{:08x}", surf.drm_fourcc));
         }
 
+        const uint32_t num_planes = std::clamp<uint32_t>(surf.num_planes, 1u, 4u);
+        bool disjoint = false;
+        if (surf.has_modifier && num_planes > 1) {
+            for (uint32_t i = 1; i < num_planes; ++i) {
+                if (surf.planes[i].fd != surf.planes[0].fd) {
+                    disjoint = true;
+                    break;
+                }
+            }
+        }
+
         std::array<VkSubresourceLayout, 4> layouts{};
-        for (uint32_t i = 0; i < surf.num_planes; ++i) {
+        for (uint32_t i = 0; i < num_planes; ++i) {
             layouts[i].offset = surf.planes[i].offset;
             layouts[i].rowPitch = surf.planes[i].stride;
         }
@@ -700,13 +874,14 @@ struct VulkanCompute::Impl {
         VkImageDrmFormatModifierExplicitCreateInfoEXT mod_info{};
         mod_info.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
         mod_info.drmFormatModifier = surf.drm_modifier;
-        mod_info.drmFormatModifierPlaneCount = surf.num_planes;
+        mod_info.drmFormatModifierPlaneCount = num_planes;
         mod_info.pPlaneLayouts = layouts.data();
         if (surf.has_modifier) ext_img.pNext = &mod_info;
 
         VkImageCreateInfo ici{};
         ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         ici.pNext = &ext_img;
+        ici.flags = disjoint ? VK_IMAGE_CREATE_DISJOINT_BIT : 0;
         ici.imageType = VK_IMAGE_TYPE_2D;
         ici.format = fm->vk_format;
         ici.extent = {surf.width, surf.height, 1};
@@ -729,54 +904,127 @@ struct VulkanCompute::Impl {
                                                surf.width, surf.height, surf.drm_modifier));
         }
 
-        VkImageMemoryRequirementsInfo2 req_info{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, nullptr, out.image};
-        VkMemoryDedicatedRequirements ded_req{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS, nullptr, VK_FALSE, VK_FALSE};
-        VkMemoryRequirements2 mem_req{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &ded_req, {}};
-        pfn_get_img_mem_req2(compute_dev, &req_info, &mem_req);
+        if (!disjoint) {
+            VkImageMemoryRequirementsInfo2 req_info{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, nullptr, out.image};
+            VkMemoryDedicatedRequirements ded_req{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS, nullptr, VK_FALSE, VK_FALSE};
+            VkMemoryRequirements2 mem_req{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &ded_req, {}};
+            pfn_get_img_mem_req2(compute_dev, &req_info, &mem_req);
 
-        int dup_fd = ::dup(surf.planes[0].fd);
-        if (dup_fd < 0) {
-            destroy_src_image(out);
-            return std::unexpected("dup() failed on KMS DMA-BUF fd");
-        }
+            int dup_fd = ::dup(surf.planes[0].fd);
+            if (dup_fd < 0) {
+                destroy_src_image(out);
+                return std::unexpected("dup() failed on KMS DMA-BUF fd");
+            }
 
-        VkMemoryFdPropertiesKHR fd_props{VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR, nullptr, 0};
-        if (pfn_get_mem_fd_props(compute_dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dup_fd, &fd_props) != VK_SUCCESS) {
-            ::close(dup_fd);
-            destroy_src_image(out);
-            return std::unexpected("vkGetMemoryFdPropertiesKHR failed");
-        }
+            VkMemoryFdPropertiesKHR fd_props{VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR, nullptr, 0};
+            if (pfn_get_mem_fd_props(compute_dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dup_fd, &fd_props) != VK_SUCCESS) {
+                ::close(dup_fd);
+                destroy_src_image(out);
+                return std::unexpected("vkGetMemoryFdPropertiesKHR failed");
+            }
 
-        uint32_t valid_bits = mem_req.memoryRequirements.memoryTypeBits & fd_props.memoryTypeBits;
-        int mem_idx = find_memory_type(valid_bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (mem_idx < 0) mem_idx = find_memory_type(valid_bits, 0);
-        if (mem_idx < 0) {
-            ::close(dup_fd);
-            destroy_src_image(out);
-            return std::unexpected("No compatible memory type for KMS DMA-BUF import");
-        }
+            uint32_t valid_bits = mem_req.memoryRequirements.memoryTypeBits & fd_props.memoryTypeBits;
+            int mem_idx = find_memory_type(valid_bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (mem_idx < 0) mem_idx = find_memory_type(valid_bits, 0);
+            if (mem_idx < 0) {
+                ::close(dup_fd);
+                destroy_src_image(out);
+                return std::unexpected("No compatible memory type for KMS DMA-BUF import");
+            }
 
-        VkImportMemoryFdInfoKHR imp_fd{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, nullptr,
-                                       VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dup_fd};
-        VkMemoryDedicatedAllocateInfo ded_alloc{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, nullptr, out.image, VK_NULL_HANDLE};
-        if (ded_req.prefersDedicatedAllocation || ded_req.requiresDedicatedAllocation) {
-            imp_fd.pNext = &ded_alloc;
-        }
+            VkImportMemoryFdInfoKHR imp_fd{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, nullptr,
+                                           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dup_fd};
+            VkMemoryDedicatedAllocateInfo ded_alloc{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, nullptr, out.image, VK_NULL_HANDLE};
+            if (ded_req.prefersDedicatedAllocation || ded_req.requiresDedicatedAllocation) {
+                imp_fd.pNext = &ded_alloc;
+            }
 
-        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp_fd,
-                                 std::max<VkDeviceSize>(mem_req.memoryRequirements.size, surf.planes[0].size),
-                                 static_cast<uint32_t>(mem_idx)};
-        if (pfn_alloc_mem(compute_dev, &mai, nullptr, &out.mem[0]) != VK_SUCCESS) {
-            ::close(dup_fd);
-            destroy_src_image(out);
-            return std::unexpected("vkAllocateMemory(KMS DMA-BUF import) failed");
-        }
-        out.num_mems = 1;
+            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp_fd,
+                                     std::max<VkDeviceSize>(mem_req.memoryRequirements.size, surf.planes[0].size),
+                                     static_cast<uint32_t>(mem_idx)};
+            if (pfn_alloc_mem(compute_dev, &mai, nullptr, &out.mem[0]) != VK_SUCCESS) {
+                ::close(dup_fd);
+                destroy_src_image(out);
+                return std::unexpected("vkAllocateMemory(KMS DMA-BUF import) failed");
+            }
+            out.num_mems = 1;
 
-        VkBindImageMemoryInfo bimi{VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, nullptr, out.image, out.mem[0], 0};
-        if (pfn_bind_image_mem2(compute_dev, 1, &bimi) != VK_SUCCESS) {
-            destroy_src_image(out);
-            return std::unexpected("vkBindImageMemory2 failed on KMS DMA-BUF");
+            VkBindImageMemoryInfo bimi{VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, nullptr, out.image, out.mem[0], 0};
+            if (pfn_bind_image_mem2(compute_dev, 1, &bimi) != VK_SUCCESS) {
+                destroy_src_image(out);
+                return std::unexpected("vkBindImageMemory2 failed on KMS DMA-BUF");
+            }
+        } else {
+            static constexpr std::array<VkImageAspectFlagBits, 4> kMemPlaneAspects = {
+                VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,
+                VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT,
+                VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT,
+                VK_IMAGE_ASPECT_MEMORY_PLANE_3_BIT_EXT,
+            };
+            std::array<VkBindImagePlaneMemoryInfo, 4> plane_binds{};
+            std::array<VkBindImageMemoryInfo, 4> bind_infos{};
+            std::array<int, 4> imported_fds{-1, -1, -1, -1};
+            std::array<VkDeviceMemory, 4> plane_mems{};
+
+            for (uint32_t p = 0; p < num_planes; ++p) {
+                VkDeviceMemory chosen_mem = VK_NULL_HANDLE;
+                for (uint32_t prev = 0; prev < p; ++prev) {
+                    if (imported_fds[prev] == surf.planes[p].fd) {
+                        chosen_mem = plane_mems[prev];
+                        break;
+                    }
+                }
+                if (chosen_mem == VK_NULL_HANDLE) {
+                    VkImagePlaneMemoryRequirementsInfo plane_req{
+                        VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO, nullptr, kMemPlaneAspects[p]};
+                    VkImageMemoryRequirementsInfo2 req_info{
+                        VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, &plane_req, out.image};
+                    VkMemoryDedicatedRequirements ded_req{
+                        VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS, nullptr, VK_FALSE, VK_FALSE};
+                    VkMemoryRequirements2 mem_req{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &ded_req, {}};
+                    pfn_get_img_mem_req2(compute_dev, &req_info, &mem_req);
+
+                    int dup_fd = ::dup(surf.planes[p].fd);
+                    if (dup_fd < 0) {
+                        destroy_src_image(out);
+                        return std::unexpected("dup() failed on multi-plane KMS DMA-BUF fd");
+                    }
+                    VkMemoryFdPropertiesKHR fd_props{VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR, nullptr, 0};
+                    if (pfn_get_mem_fd_props(compute_dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dup_fd, &fd_props) != VK_SUCCESS) {
+                        ::close(dup_fd);
+                        destroy_src_image(out);
+                        return std::unexpected("vkGetMemoryFdPropertiesKHR failed on multi-plane KMS DMA-BUF");
+                    }
+                    uint32_t valid_bits = mem_req.memoryRequirements.memoryTypeBits & fd_props.memoryTypeBits;
+                    int mem_idx = find_memory_type(valid_bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                    if (mem_idx < 0) mem_idx = find_memory_type(valid_bits, 0);
+                    if (mem_idx < 0) {
+                        ::close(dup_fd);
+                        destroy_src_image(out);
+                        return std::unexpected("No compatible memory type for multi-plane KMS DMA-BUF import");
+                    }
+                    VkImportMemoryFdInfoKHR imp_fd{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, nullptr,
+                                                   VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dup_fd};
+                    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp_fd,
+                                             std::max<VkDeviceSize>(mem_req.memoryRequirements.size, surf.planes[p].size),
+                                             static_cast<uint32_t>(mem_idx)};
+                    if (pfn_alloc_mem(compute_dev, &mai, nullptr, &chosen_mem) != VK_SUCCESS) {
+                        ::close(dup_fd);
+                        destroy_src_image(out);
+                        return std::unexpected("vkAllocateMemory(multi-plane KMS DMA-BUF) failed");
+                    }
+                    out.mem[out.num_mems++] = chosen_mem;
+                }
+                imported_fds[p] = surf.planes[p].fd;
+                plane_mems[p] = chosen_mem;
+                plane_binds[p] = {VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO, nullptr, kMemPlaneAspects[p]};
+                bind_infos[p] = {VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, &plane_binds[p], out.image, chosen_mem, 0};
+            }
+
+            if (pfn_bind_image_mem2(compute_dev, num_planes, bind_infos.data()) != VK_SUCCESS) {
+                destroy_src_image(out);
+                return std::unexpected("vkBindImageMemory2 failed on multi-plane KMS DMA-BUF");
+            }
         }
 
         VkImageViewCreateInfo ivci{};
@@ -808,6 +1056,7 @@ struct VulkanCompute::Impl {
                     }
                     return SrcBinding{src_cache[0].image, src_cache[0].view};
                 }
+                for (size_t s = 0; s < kNumSlots; ++s) wait_slot_impl(s);
                 destroy_src_image(c);
                 src_cache.erase(src_cache.begin() + static_cast<ptrdiff_t>(i));
                 break;
@@ -816,6 +1065,7 @@ struct VulkanCompute::Impl {
 
         // Evict least-recently-used tail entry when full
         if (src_cache.size() >= kMaxCachedSurfaces) {
+            for (size_t s = 0; s < kNumSlots; ++s) wait_slot_impl(s);
             destroy_src_image(src_cache.back());
             src_cache.pop_back();
         }
@@ -833,12 +1083,7 @@ struct VulkanCompute::Impl {
             if (da.key_img == key) return &da;
         }
 
-        int mem_fd = -1;
-        VkMemoryGetFdInfoKHR gfdi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, nullptr,
-                                  vkf->mem[0], VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT};
-        if (pfn_ff_get_mem_fd(vkctx->act_dev, &gfdi, &mem_fd) != VK_SUCCESS || mem_fd < 0) {
-            return std::unexpected("Failed to export AVVkFrame memory as OPAQUE_FD");
-        }
+        const bool disjoint_planes = (vkf->mem[1] != VK_NULL_HANDLE && vkf->mem[1] != vkf->mem[0]);
 
         VkExternalMemoryImageCreateInfo ext_img{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, nullptr,
                                                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT};
@@ -846,10 +1091,20 @@ struct VulkanCompute::Impl {
                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (compute_has_video_enc_ext) usage |= VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR;
 
+        VkImageCreateFlags create_flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+                                          VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
+                                          VK_IMAGE_CREATE_ALIAS_BIT;
+        if (compute_has_video_maint1) {
+            create_flags |= VK_IMAGE_CREATE_VIDEO_PROFILE_INDEPENDENT_BIT_KHR;
+        }
+        if (disjoint_planes) {
+            create_flags |= VK_IMAGE_CREATE_DISJOINT_BIT;
+        }
+
         VkImageCreateInfo ici{};
         ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         ici.pNext = &ext_img;
-        ici.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | VK_IMAGE_CREATE_ALIAS_BIT;
+        ici.flags = create_flags;
         ici.imageType = VK_IMAGE_TYPE_2D;
         ici.format = (cfg.pixfmt == PixelFormat::P010)
             ? VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
@@ -858,41 +1113,70 @@ struct VulkanCompute::Impl {
         ici.mipLevels = 1;
         ici.arrayLayers = 1;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
-        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.tiling = vkf->tiling;
         ici.usage = usage;
         ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
         CachedDstAlias da{};
         da.key_img = key;
         if (pfn_create_image(compute_dev, &ici, nullptr, &da.image) != VK_SUCCESS) {
-            ::close(mem_fd);
             return std::unexpected("Failed to create aliased AVVkFrame image on compute_dev");
         }
 
-        VkImageMemoryRequirementsInfo2 rinfo{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, nullptr, da.image};
-        VkMemoryDedicatedRequirements ded_req{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS, nullptr, VK_FALSE, VK_FALSE};
-        VkMemoryRequirements2 mreq{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &ded_req, {}};
-        pfn_get_img_mem_req2(compute_dev, &rinfo, &mreq);
+        const uint32_t n_mems = disjoint_planes ? 2u : 1u;
+        static constexpr std::array<VkImageAspectFlagBits, 2> kPlaneAspects = {
+            VK_IMAGE_ASPECT_PLANE_0_BIT, VK_IMAGE_ASPECT_PLANE_1_BIT};
+        std::array<VkBindImagePlaneMemoryInfo, 2> plane_binds{};
+        std::array<VkBindImageMemoryInfo, 2> bind_infos{};
 
-        int midx = find_memory_type(mreq.memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (midx < 0) midx = find_memory_type(mreq.memoryRequirements.memoryTypeBits, 0);
+        for (uint32_t p = 0; p < n_mems; ++p) {
+            int mem_fd = -1;
+            VkMemoryGetFdInfoKHR gfdi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, nullptr,
+                                      vkf->mem[p], VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT};
+            if (pfn_ff_get_mem_fd(vkctx->act_dev, &gfdi, &mem_fd) != VK_SUCCESS || mem_fd < 0) {
+                destroy_dst_alias(da);
+                return std::unexpected("Failed to export AVVkFrame memory as OPAQUE_FD");
+            }
 
-        VkImportMemoryFdInfoKHR imp_fd{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, nullptr,
-                                       VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT, mem_fd};
-        VkMemoryDedicatedAllocateInfo ded_alloc{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, nullptr, da.image, VK_NULL_HANDLE};
-        if (ded_req.prefersDedicatedAllocation || ded_req.requiresDedicatedAllocation) imp_fd.pNext = &ded_alloc;
+            VkImagePlaneMemoryRequirementsInfo preq{
+                VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO, nullptr, kPlaneAspects[p]};
+            VkImageMemoryRequirementsInfo2 rinfo{
+                VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, disjoint_planes ? &preq : nullptr, da.image};
+            VkMemoryDedicatedRequirements ded_req{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS, nullptr, VK_FALSE, VK_FALSE};
+            VkMemoryRequirements2 mreq{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &ded_req, {}};
+            pfn_get_img_mem_req2(compute_dev, &rinfo, &mreq);
 
-        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp_fd,
-                                 std::max<VkDeviceSize>(mreq.memoryRequirements.size, vkf->size[0]),
-                                 static_cast<uint32_t>(midx)};
-        if (pfn_alloc_mem(compute_dev, &mai, nullptr, &da.mem) != VK_SUCCESS) {
-            ::close(mem_fd);
-            destroy_dst_alias(da);
-            return std::unexpected("Failed to import AVVkFrame OPAQUE_FD memory on compute_dev");
+            int midx = find_memory_type(mreq.memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (midx < 0) midx = find_memory_type(mreq.memoryRequirements.memoryTypeBits, 0);
+
+            VkImportMemoryFdInfoKHR imp_fd{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, nullptr,
+                                           VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT, mem_fd};
+            VkMemoryDedicatedAllocateInfo ded_alloc{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, nullptr, da.image, VK_NULL_HANDLE};
+            if (!disjoint_planes && (ded_req.prefersDedicatedAllocation || ded_req.requiresDedicatedAllocation)) {
+                imp_fd.pNext = &ded_alloc;
+            }
+
+            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp_fd,
+                                     std::max<VkDeviceSize>(mreq.memoryRequirements.size, vkf->size[p]),
+                                     static_cast<uint32_t>(midx)};
+            if (pfn_alloc_mem(compute_dev, &mai, nullptr, &da.mem[p]) != VK_SUCCESS) {
+                ::close(mem_fd);
+                destroy_dst_alias(da);
+                return std::unexpected("Failed to import AVVkFrame OPAQUE_FD memory on compute_dev");
+            }
+            da.num_mems = p + 1;
+
+            if (disjoint_planes) {
+                plane_binds[p] = {VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO, nullptr, kPlaneAspects[p]};
+                bind_infos[p] = {VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, &plane_binds[p],
+                                 da.image, da.mem[p], static_cast<VkDeviceSize>(vkf->offset[p])};
+            } else {
+                bind_infos[0] = {VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, nullptr,
+                                 da.image, da.mem[0], static_cast<VkDeviceSize>(vkf->offset[0])};
+            }
         }
 
-        VkBindImageMemoryInfo bimi{VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, nullptr, da.image, da.mem, static_cast<VkDeviceSize>(vkf->offset[0])};
-        if (pfn_bind_image_mem2(compute_dev, 1, &bimi) != VK_SUCCESS) {
+        if (pfn_bind_image_mem2(compute_dev, n_mems, bind_infos.data()) != VK_SUCCESS) {
             destroy_dst_alias(da);
             return std::unexpected("Failed to bind aliased AVVkFrame memory on compute_dev");
         }
@@ -925,7 +1209,8 @@ VulkanCompute::~VulkanCompute() = default;
 std::expected<std::unique_ptr<VulkanCompute>, std::string> VulkanCompute::create(
     const Config &cfg,
     bool convert_gamut,
-    const std::array<float, 9> &gamut_matrix) {
+    const std::array<float, 9> &gamut_matrix,
+    std::string_view drm_card_path) {
     auto vc = std::unique_ptr<VulkanCompute>(new VulkanCompute());
     vc->impl_ = std::make_unique<Impl>();
     Impl *impl = vc->impl_.get();
@@ -933,7 +1218,9 @@ std::expected<std::unique_ptr<VulkanCompute>, std::string> VulkanCompute::create
     impl->convert_gamut = convert_gamut;
     impl->gamut_matrix = gamut_matrix;
 
-    std::string dev_str = std::to_string(cfg.device_index);
+    const uint32_t resolved_dev_idx = resolve_vulkan_device_index(
+        cfg.device_index, cfg.device_explicit, drm_card_path);
+    std::string dev_str = std::to_string(resolved_dev_idx);
     int err = av_hwdevice_ctx_create(&impl->hw_device_ref, AV_HWDEVICE_TYPE_VULKAN, dev_str.c_str(), nullptr, 0);
     if (err < 0) {
         char buf[128];
@@ -951,9 +1238,10 @@ std::expected<std::unique_ptr<VulkanCompute>, std::string> VulkanCompute::create
         VkPhysicalDeviceProperties props{};
         auto pfn_get_props = impl->load_inst<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties");
         pfn_get_props(impl->vkctx->phys_dev, &props);
-        std::cerr << std::format("[vulkan] device[{}]='{}' isolated compute_qf={} push_desc={}\n",
-                                 cfg.device_index, props.deviceName, impl->compute_qf_idx,
-                                 impl->use_push_descriptors ? "yes" : "no");
+        std::cerr << std::format("[vulkan] device[{}]='{}' isolated compute_qf={} push_desc={} video_maint1={}\n",
+                                 resolved_dev_idx, props.deviceName, impl->compute_qf_idx,
+                                 impl->use_push_descriptors ? "yes" : "no",
+                                 impl->compute_has_video_maint1 ? "yes" : "no");
     }
 
     return vc;
@@ -1032,10 +1320,8 @@ std::expected<void, std::string> VulkanCompute::configure_output(uint32_t width,
     return {};
 }
 
-std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFrame &kf) {
+std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_frame(const KmsFrame &kf) {
     if (!impl_->hw_frames_ref) return std::unexpected("VulkanCompute output not configured");
-
-    const auto t0 = std::chrono::steady_clock::now();
 
     // LIFO pool probing using reusable empty AVFrame shells to avoid malloc/free thrashing
     size_t nb_busy = 0;
@@ -1043,7 +1329,7 @@ std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFram
 
     for (size_t attempt = 0; attempt < impl_->probe_shells.size(); ++attempt) {
         if (!impl_->probe_shells[attempt]) {
-            impl_->probe_shells[attempt] = av_frame_alloc();
+            impl_->probe_shells[attempt] = impl_->acquire_shell();
             if (!impl_->probe_shells[attempt]) break;
         }
         AVFrame *cand = impl_->probe_shells[attempt];
@@ -1087,14 +1373,14 @@ std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFram
     auto *vkf = reinterpret_cast<AVVkFrame *>(dst_frame->data[0]);
     auto dst_alias_res = impl_->get_or_create_dst_alias(vkf);
     if (!dst_alias_res) {
-        av_frame_free(&dst_frame);
+        impl_->recycle_shell(dst_frame);
         return std::unexpected(dst_alias_res.error());
     }
     CachedDstAlias *dst_alias = *dst_alias_res;
 
     auto src_res = impl_->get_or_import_surface(kf.primary);
     if (!src_res) {
-        av_frame_free(&dst_frame);
+        impl_->recycle_shell(dst_frame);
         return std::unexpected(src_res.error());
     }
     const SrcBinding src = *src_res;
@@ -1109,8 +1395,29 @@ std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFram
         }
     }
 
-    CmdSlot &sl = impl_->slots[impl_->slot_cursor];
+    const float crop_x = kf.crop.valid() ? static_cast<float>(kf.crop.x) : 0.0f;
+    const float crop_y = kf.crop.valid() ? static_cast<float>(kf.crop.y) : 0.0f;
+    const float crop_w = kf.crop.valid() ? static_cast<float>(kf.crop.width) : static_cast<float>(kf.primary.width);
+    const float crop_h = kf.crop.valid() ? static_cast<float>(kf.crop.height) : static_cast<float>(kf.primary.height);
+
+    const bool exact_1to1 =
+        (static_cast<uint32_t>(crop_w) == impl_->out_width) &&
+        (static_cast<uint32_t>(crop_h) == impl_->out_height);
+
+    auto pipe_res = impl_->get_or_create_pipeline(exact_1to1, has_cursor);
+    if (!pipe_res) {
+        impl_->recycle_shell(dst_frame);
+        return std::unexpected(pipe_res.error());
+    }
+    VkPipeline pipe = *pipe_res;
+
+    const auto t0 = std::chrono::steady_clock::now();
+
+    const size_t slot_idx = impl_->slot_cursor;
     impl_->slot_cursor = (impl_->slot_cursor + 1) % Impl::kNumSlots;
+    // Wait on this slot only if it is still in flight from kNumSlots frames ago
+    impl_->wait_slot_impl(slot_idx);
+    CmdSlot &sl = impl_->slots[slot_idx];
 
     impl_->pfn_reset_cp(impl_->compute_dev, sl.pool, 0);
     impl_->pfn_reset_fences(impl_->compute_dev, 1, &sl.fence);
@@ -1118,11 +1425,12 @@ std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFram
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr,
                                   VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
     if (impl_->pfn_begin_cb(sl.cmd, &cbbi) != VK_SUCCESS) {
-        av_frame_free(&dst_frame);
+        impl_->recycle_shell(dst_frame);
         return std::unexpected("vkBeginCommandBuffer failed");
     }
 
     int sync_fd = -1;
+#ifdef DMA_BUF_IOCTL_EXPORT_SYNC_FILE
     if (kf.primary.planes[0].fd >= 0) {
         dma_buf_export_sync_file ex{DMA_BUF_SYNC_READ, -1};
         if (::ioctl(kf.primary.planes[0].fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &ex) == 0 && ex.fd >= 0) {
@@ -1134,6 +1442,7 @@ std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFram
             }
         }
     }
+#endif
 
     bool has_ext_sem = false;
     if (sync_fd >= 0) {
@@ -1188,33 +1497,29 @@ std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFram
         b.image = cur_img.image;
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     }
-    if (!dst_alias->initialized_layout) {
+    {
         auto &b = pre_barriers[nb_pre++];
         b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (!dst_alias->initialized_layout) {
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            dst_alias->initialized_layout = true;
+        } else {
+            b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+            b.dstQueueFamilyIndex = impl_->compute_qf_idx;
+        }
         b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.image = dst_alias->image;
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        dst_alias->initialized_layout = true;
     }
 
     VkDependencyInfo dep_pre{VK_STRUCTURE_TYPE_DEPENDENCY_INFO, nullptr, 0, 0, nullptr, 0, nullptr, nb_pre, pre_barriers.data()};
     impl_->pfn_cmd_barrier2(sl.cmd, &dep_pre);
 
-    const float crop_x = kf.crop.valid() ? static_cast<float>(kf.crop.x) : 0.0f;
-    const float crop_y = kf.crop.valid() ? static_cast<float>(kf.crop.y) : 0.0f;
-    const float crop_w = kf.crop.valid() ? static_cast<float>(kf.crop.width) : static_cast<float>(kf.primary.width);
-    const float crop_h = kf.crop.valid() ? static_cast<float>(kf.crop.height) : static_cast<float>(kf.primary.height);
-
-    const bool exact_1to1 =
-        (static_cast<uint32_t>(crop_w) == impl_->out_width) &&
-        (static_cast<uint32_t>(crop_h) == impl_->out_height);
-
-    VkPipeline pipe = impl_->pipes[exact_1to1 ? 1 : 0][has_cursor ? 1 : 0];
     impl_->pfn_cmd_bind_pipe(sl.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     if (impl_->use_push_descriptors) {
         impl_->pfn_cmd_push_desc(sl.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, impl_->pipe_layout, 0,
@@ -1267,10 +1572,11 @@ std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFram
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     }
     {
+        // Read-only sampled source: srcAccessMask = 0 avoids unnecessary writeback cache flushes
         auto &b = post_barriers[nb_post++];
         b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        b.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        b.srcAccessMask = 0;
         b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
         b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         b.srcQueueFamilyIndex = impl_->compute_qf_idx;
@@ -1282,7 +1588,7 @@ std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFram
         auto &b = post_barriers[nb_post++];
         b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        b.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        b.srcAccessMask = 0;
         b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
         b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         b.srcQueueFamilyIndex = impl_->compute_qf_idx;
@@ -1294,7 +1600,7 @@ std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFram
     impl_->pfn_cmd_barrier2(sl.cmd, &dep_post);
 
     if (impl_->pfn_end_cb(sl.cmd) != VK_SUCCESS) {
-        av_frame_free(&dst_frame);
+        impl_->recycle_shell(dst_frame);
         return std::unexpected("vkEndCommandBuffer failed");
     }
 
@@ -1305,12 +1611,15 @@ std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFram
                       has_ext_sem ? 1u : 0u, has_ext_sem ? &wait_ext : nullptr,
                       1, &cbsi, 0, nullptr};
 
-    if (impl_->pfn_queue_submit2(impl_->compute_queue, 1, &si2, sl.fence) != VK_SUCCESS) {
-        av_frame_free(&dst_frame);
-        return std::unexpected("vkQueueSubmit2 failed for compute color conversion");
+    {
+        std::lock_guard lk(sl.mtx);
+        sl.submit_t0 = t0;
+        if (impl_->pfn_queue_submit2(impl_->compute_queue, 1, &si2, sl.fence) != VK_SUCCESS) {
+            impl_->recycle_shell(dst_frame);
+            return std::unexpected("vkQueueSubmit2 failed for compute color conversion");
+        }
+        sl.in_flight = true;
     }
-
-    impl_->pfn_wait_fences(impl_->compute_dev, 1, &sl.fence, VK_TRUE, UINT64_MAX);
 
     dst_frame->color_range = (impl_->cfg.color_range == ColorRange::Full) ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
     dst_frame->colorspace = (impl_->cfg.color_space == ColorSpace::Bt2020) ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709;
@@ -1318,19 +1627,34 @@ std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFram
     dst_frame->color_trc = (impl_->cfg.color_space == ColorSpace::Bt2020) ? AVCOL_TRC_BT2020_10 : AVCOL_TRC_BT709;
     dst_frame->chroma_location = AVCHROMA_LOC_LEFT;
 
-    const auto t1 = std::chrono::steady_clock::now();
-    impl_->stats.frames_processed++;
-    impl_->stats.total_compute_ns += static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+    return SubmittedFrame{dst_frame, static_cast<uint32_t>(slot_idx)};
+}
 
-    return dst_frame;
+void VulkanCompute::wait_slot(uint32_t slot) noexcept {
+    impl_->wait_slot_impl(slot);
+}
+
+void VulkanCompute::recycle_frame(AVFrame *&frame) noexcept {
+    impl_->recycle_shell(frame);
+}
+
+std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFrame &kf) {
+    auto sub = submit_frame(kf);
+    if (!sub) return std::unexpected(sub.error());
+    wait_slot(sub->slot);
+    return sub->frame;
 }
 
 AVBufferRef *VulkanCompute::hw_device_ref() const noexcept { return impl_->hw_device_ref; }
 AVBufferRef *VulkanCompute::hw_frames_ref() const noexcept { return impl_->hw_frames_ref; }
 uint32_t VulkanCompute::output_width() const noexcept { return impl_->out_width; }
 uint32_t VulkanCompute::output_height() const noexcept { return impl_->out_height; }
-ComputeStats VulkanCompute::stats() const noexcept { return impl_->stats; }
+ComputeStats VulkanCompute::stats() const noexcept {
+    return {
+        impl_->stat_frames_processed.load(std::memory_order_relaxed),
+        impl_->stat_total_compute_ns.load(std::memory_order_relaxed),
+    };
+}
 
 std::expected<VulkanCompute::TestDmaBuf, std::string> VulkanCompute::create_test_dmabuf(
     uint32_t width, uint32_t height, uint32_t frame_idx, bool is_cursor) {

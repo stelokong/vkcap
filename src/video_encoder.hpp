@@ -44,6 +44,7 @@ public:
 
     bool audio_enabled() const noexcept;
     int audio_frame_size() const noexcept;
+    Codec active_codec() const noexcept;
     EncoderStats stats() const noexcept;
 
 private:

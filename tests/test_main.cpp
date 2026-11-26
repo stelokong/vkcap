@@ -362,7 +362,7 @@ void test_kms_gpu_pipeline(PixelFormat pixfmt,
         check(fres.has_value(), "VulkanCompute::process_frame");
         AVFrame *avf = *fres;
         check(enc->encode_frame(avf, static_cast<int64_t>(i)).has_value(), "VideoEncoder::encode_frame");
-        av_frame_free(&avf);
+        vk->recycle_frame(avf);
     }
     if (with_audio) {
         const int afsz = enc->audio_frame_size();

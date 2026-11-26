@@ -423,24 +423,37 @@ std::expected<KmsFrame, std::string> KmsCapture::grab_frame() {
     int32_t cx = 0, cy = 0;
     uint32_t cw = 0, ch = 0;
     if (impl_->cfg.capture_cursor && impl_->display.cursor_plane_id != 0 && impl_->prop_cursor_fb != 0) {
-        uint32_t prop_ids[32]{};
-        uint64_t prop_vals[32]{};
+        uint32_t prop_ids[64]{};
+        uint64_t prop_vals[64]{};
         drm_mode_obj_get_properties req{};
         req.obj_id = impl_->display.cursor_plane_id;
         req.obj_type = DRM_MODE_OBJECT_PLANE;
-        req.count_props = 32;
+        req.count_props = 64;
         req.props_ptr = reinterpret_cast<uintptr_t>(prop_ids);
         req.prop_values_ptr = reinterpret_cast<uintptr_t>(prop_vals);
-        if (::ioctl(impl_->drm_fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &req) == 0) {
-            const uint32_t n = std::min<uint32_t>(req.count_props, 32u);
+        auto scan_props = [&](const uint32_t *ids, const uint64_t *vals, uint32_t n) {
             for (uint32_t i = 0; i < n; ++i) {
-                const uint32_t id = prop_ids[i];
-                const uint64_t val = prop_vals[i];
+                const uint32_t id = ids[i];
+                const uint64_t val = vals[i];
                 if (id == impl_->prop_cursor_fb) c_fb = static_cast<uint32_t>(val);
                 else if (id == impl_->prop_cursor_x) cx = static_cast<int32_t>(val);
                 else if (id == impl_->prop_cursor_y) cy = static_cast<int32_t>(val);
                 else if (id == impl_->prop_cursor_w) cw = static_cast<uint32_t>(val);
                 else if (id == impl_->prop_cursor_h) ch = static_cast<uint32_t>(val);
+            }
+        };
+        if (::ioctl(impl_->drm_fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &req) == 0) {
+            if (req.count_props <= 64u) {
+                scan_props(prop_ids, prop_vals, req.count_props);
+            } else {
+                std::vector<uint32_t> dyn_ids(req.count_props);
+                std::vector<uint64_t> dyn_vals(req.count_props);
+                req.props_ptr = reinterpret_cast<uintptr_t>(dyn_ids.data());
+                req.prop_values_ptr = reinterpret_cast<uintptr_t>(dyn_vals.data());
+                if (::ioctl(impl_->drm_fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &req) == 0) {
+                    scan_props(dyn_ids.data(), dyn_vals.data(),
+                               std::min<uint32_t>(req.count_props, static_cast<uint32_t>(dyn_ids.size())));
+                }
             }
         }
     }

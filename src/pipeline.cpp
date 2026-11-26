@@ -41,6 +41,7 @@ void sleep_until_monotonic_ns(int64_t target_ns) {
 
 struct EncodedInput {
     AVFrame *frame = nullptr;
+    uint32_t slot = 0;
     int64_t pts_ticks = 0;
 };
 
@@ -49,12 +50,13 @@ public:
     explicit EncodeFrameQueue(size_t capacity)
         : capacity_(std::max<size_t>(1, capacity)), ring_(capacity_) {}
 
-    void push(AVFrame *frame, int64_t pts_ticks) {
+    void push(AVFrame *frame, uint32_t slot, int64_t pts_ticks, VulkanCompute *vk = nullptr) {
         AVFrame *evicted = nullptr;
         {
             std::lock_guard lk(mtx_);
             if (closed_) {
-                av_frame_free(&frame);
+                if (vk) vk->recycle_frame(frame);
+                else av_frame_free(&frame);
                 return;
             }
             if (count_ == capacity_) {
@@ -63,11 +65,14 @@ public:
                 --count_;
                 ++dropped_;
             }
-            ring_[tail_] = {frame, pts_ticks};
+            ring_[tail_] = {frame, slot, pts_ticks};
             tail_ = (tail_ + 1) % capacity_;
             ++count_;
         }
-        if (evicted) av_frame_free(&evicted);
+        if (evicted) {
+            if (vk) vk->recycle_frame(evicted);
+            else av_frame_free(&evicted);
+        }
         cv_.notify_one();
     }
 
@@ -124,7 +129,7 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
     const auto &disp = kms->display();
     const ResolvedGamut gamut = resolve_input_gamut(cfg, disp.edid_primaries);
 
-    auto vk_res = VulkanCompute::create(cfg, gamut.enabled, gamut.matrix);
+    auto vk_res = VulkanCompute::create(cfg, gamut.enabled, gamut.matrix, disp.card_path);
     if (!vk_res) return std::unexpected(vk_res.error());
     auto vk = std::move(*vk_res);
 
@@ -196,11 +201,13 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
         }
     }
 
+    const char *vcodec_str = (encoder->active_codec() == Codec::Av1) ? "AV1"
+                           : (encoder->active_codec() == Codec::Hevc) ? "HEVC" : "H.264";
     std::cerr << std::format(
-        "[vkcap] Recording {} ({} {}x{}@{:.1f}Hz -> {}x{}, {}, CFR {}fps{})\n"
+        "[vkcap] Recording {} ({} {}x{}@{:.1f}Hz -> {}x{}, {} {}, CFR {}fps{})\n"
         "[vkcap] Color gamut: {} | Audio: {}\n",
         cfg.output_path, disp.connector_name, src_w, src_h, disp.refresh_hz, enc_w, enc_h,
-        cfg.pixfmt == PixelFormat::P010 ? "AV1 10-bit P010" : "AV1 8-bit NV12",
+        vcodec_str, cfg.pixfmt == PixelFormat::P010 ? "10-bit P010" : "8-bit NV12",
         cfg.fps, cfg.capture_cursor ? ", hw-cursor" : "",
         gamut.description, audio_desc);
 
@@ -223,8 +230,9 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
         pthread_setname_np(pthread_self(), "vkcap-enc");
         EncodedInput item{};
         while (encode_queue.pop(item)) {
+            vk->wait_slot(item.slot);
             auto enc_err = encoder->encode_frame(item.frame, item.pts_ticks);
-            av_frame_free(&item.frame);
+            vk->recycle_frame(item.frame);
             if (!enc_err) {
                 record_err(enc_err.error());
                 break;
@@ -280,7 +288,7 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
                 if (monotonic_now_ns() < target_ns) {
                     sleep_until_monotonic_ns(target_ns);
                 }
-                if (audio_stop.load(std::memory_order_acquire) &&
+                if (audio_stop.load(std::memory_order_acquire) ||
                     stop_flag.load(std::memory_order_acquire)) {
                     break;
                 }
@@ -296,13 +304,13 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
         });
     }
 
-    // Submit the already-grabbed first frame immediately
+    // Submit the already-grabbed first frame immediately (asynchronously on compute_dev)
     {
-        auto gpu_res = vk->process_frame(*first_res);
+        auto gpu_res = vk->submit_frame(*first_res);
         if (!gpu_res) {
             record_err(gpu_res.error());
         } else {
-            encode_queue.push(*gpu_res, frame_idx++);
+            encode_queue.push(gpu_res->frame, gpu_res->slot, frame_idx++, vk.get());
         }
     }
 
@@ -335,12 +343,12 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
             continue;
         }
 
-        auto gpu_res = vk->process_frame(*frame_res);
+        auto gpu_res = vk->submit_frame(*frame_res);
         if (!gpu_res) {
             record_err(gpu_res.error());
             break;
         }
-        encode_queue.push(*gpu_res, frame_idx++);
+        encode_queue.push(gpu_res->frame, gpu_res->slot, frame_idx++, vk.get());
     }
 
     audio_stop.store(true, std::memory_order_release);

@@ -10,12 +10,15 @@
 #include <pthread.h>
 #include <thread>
 #include <vector>
+#include <vulkan/vulkan.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/dict.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_vulkan.h>
 #include <libavutil/opt.h>
 }
 
@@ -68,6 +71,94 @@ std::string ff_err(int err) {
     char buf[128];
     av_strerror(err, buf, sizeof(buf));
     return std::string(buf);
+}
+
+struct VkEncodeCaps {
+    bool probed = false;
+    bool has_av1 = false;
+    bool has_hevc = false;
+    bool has_h264 = false;
+    uint32_t max_quality_levels = 2;  // Conservative fallback if query unavailable
+};
+
+VkEncodeCaps probe_vk_encode_caps(AVBufferRef *hw_device_ref, Codec codec, PixelFormat pixfmt) {
+    VkEncodeCaps caps{};
+    if (!hw_device_ref || !hw_device_ref->data) return caps;
+    auto *hwdev = reinterpret_cast<AVHWDeviceContext *>(hw_device_ref->data);
+    auto *vkctx = reinterpret_cast<AVVulkanDeviceContext *>(hwdev->hwctx);
+    if (!vkctx || !vkctx->inst || !vkctx->phys_dev || !vkctx->get_proc_addr) return caps;
+
+    auto pfn_enum = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+        vkctx->get_proc_addr(vkctx->inst, "vkEnumerateDeviceExtensionProperties"));
+    if (!pfn_enum) return caps;
+
+    uint32_t ext_cnt = 0;
+    if (pfn_enum(vkctx->phys_dev, nullptr, &ext_cnt, nullptr) != VK_SUCCESS) return caps;
+    std::vector<VkExtensionProperties> exts(ext_cnt);
+    pfn_enum(vkctx->phys_dev, nullptr, &ext_cnt, exts.data());
+    caps.probed = true;
+    for (const auto &e : exts) {
+        if (std::strcmp(e.extensionName, VK_KHR_VIDEO_ENCODE_AV1_EXTENSION_NAME) == 0) caps.has_av1 = true;
+        else if (std::strcmp(e.extensionName, VK_KHR_VIDEO_ENCODE_H265_EXTENSION_NAME) == 0) caps.has_hevc = true;
+        else if (std::strcmp(e.extensionName, VK_KHR_VIDEO_ENCODE_H264_EXTENSION_NAME) == 0) caps.has_h264 = true;
+    }
+
+    auto pfn_get_caps = reinterpret_cast<PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR>(
+        vkctx->get_proc_addr(vkctx->inst, "vkGetPhysicalDeviceVideoCapabilitiesKHR"));
+    if (!pfn_get_caps) return caps;
+
+    VkVideoProfileInfoKHR prof{};
+    prof.sType = VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR;
+    prof.chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR;
+    const VkVideoComponentBitDepthFlagBitsKHR bd = (pixfmt == PixelFormat::P010)
+        ? VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR
+        : VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
+    prof.lumaBitDepth = bd;
+    prof.chromaBitDepth = bd;
+
+    VkVideoEncodeAV1ProfileInfoKHR av1_p{VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR, nullptr, STD_VIDEO_AV1_PROFILE_MAIN};
+    VkVideoEncodeH265ProfileInfoKHR h265_p{VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_PROFILE_INFO_KHR, nullptr,
+                                           (pixfmt == PixelFormat::P010) ? STD_VIDEO_H265_PROFILE_IDC_MAIN_10 : STD_VIDEO_H265_PROFILE_IDC_MAIN};
+    VkVideoEncodeH264ProfileInfoKHR h264_p{VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_PROFILE_INFO_KHR, nullptr, STD_VIDEO_H264_PROFILE_IDC_HIGH};
+
+    switch (codec) {
+        case Codec::Av1:
+            if (!caps.has_av1) return caps;
+            prof.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR;
+            prof.pNext = &av1_p;
+            break;
+        case Codec::Hevc:
+            if (!caps.has_hevc) return caps;
+            prof.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR;
+            prof.pNext = &h265_p;
+            break;
+        case Codec::H264:
+            if (!caps.has_h264) return caps;
+            prof.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR;
+            prof.pNext = &h264_p;
+            break;
+    }
+
+    VkVideoEncodeAV1CapabilitiesKHR av1_caps{};
+    av1_caps.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_CAPABILITIES_KHR;
+    VkVideoEncodeH265CapabilitiesKHR h265_caps{};
+    h265_caps.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_CAPABILITIES_KHR;
+    VkVideoEncodeH264CapabilitiesKHR h264_caps{};
+    h264_caps.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_CAPABILITIES_KHR;
+
+    VkVideoEncodeCapabilitiesKHR enc_caps{};
+    enc_caps.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_CAPABILITIES_KHR;
+    if (codec == Codec::Av1) enc_caps.pNext = &av1_caps;
+    else if (codec == Codec::Hevc) enc_caps.pNext = &h265_caps;
+    else enc_caps.pNext = &h264_caps;
+
+    VkVideoCapabilitiesKHR vcaps{};
+    vcaps.sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR;
+    vcaps.pNext = &enc_caps;
+    if (pfn_get_caps(vkctx->phys_dev, &prof, &vcaps) == VK_SUCCESS && enc_caps.maxQualityLevels > 0) {
+        caps.max_quality_levels = enc_caps.maxQualityLevels;
+    }
+    return caps;
 }
 
 }  // namespace
@@ -258,7 +349,29 @@ std::expected<std::unique_ptr<VideoEncoder>, std::string> VideoEncoder::open(
                                            cfg.output_path, ff_err(err)));
     }
 
-    const char *cname = codec_name(cfg.codec);
+    // Probe GPU Vulkan Video encode extensions & quality levels for cross-vendor / older-GPU compatibility
+    Codec chosen_codec = cfg.codec;
+    VkEncodeCaps vcaps = probe_vk_encode_caps(hw_device_ref, chosen_codec, cfg.pixfmt);
+    if (vcaps.probed && !cfg.codec_explicit) {
+        auto codec_supported = [&](Codec c) {
+            if (c == Codec::Av1) return vcaps.has_av1;
+            if (c == Codec::Hevc) return vcaps.has_hevc;
+            return vcaps.has_h264;
+        };
+        if (!codec_supported(chosen_codec)) {
+            if (vcaps.has_hevc) chosen_codec = Codec::Hevc;
+            else if (vcaps.has_h264) chosen_codec = Codec::H264;
+            if (chosen_codec != cfg.codec) {
+                std::cerr << std::format(
+                    "[vkcap] GPU does not advertise {}; auto-falling back to {}\n",
+                    codec_name(cfg.codec), codec_name(chosen_codec));
+                vcaps = probe_vk_encode_caps(hw_device_ref, chosen_codec, cfg.pixfmt);
+            }
+        }
+    }
+    impl->cfg.codec = chosen_codec;
+
+    const char *cname = codec_name(chosen_codec);
     const AVCodec *codec = avcodec_find_encoder_by_name(cname);
     if (!codec) {
         return std::unexpected(std::format("FFmpeg encoder '{}' not found", cname));
@@ -277,8 +390,9 @@ std::expected<std::unique_ptr<VideoEncoder>, std::string> VideoEncoder::open(
     const int eff_idr = (cfg.idr_interval > 0)
         ? cfg.idr_interval
         : static_cast<int>(std::max<uint32_t>(1u, cfg.fps) * 2u);
-    const int eff_qp = (cfg.qp >= 0) ? cfg.qp : (cfg.codec == Codec::Av1 ? 52 : 22);
-    const int eff_quality = (cfg.quality >= 0) ? cfg.quality : 1;
+    const int eff_qp = (cfg.qp >= 0) ? cfg.qp : (chosen_codec == Codec::Av1 ? 52 : 22);
+    const int max_q = static_cast<int>(std::max<uint32_t>(1u, vcaps.max_quality_levels)) - 1;
+    const int eff_quality = (cfg.quality >= 0) ? std::min(cfg.quality, max_q) : std::min(1, max_q);
 
     impl->enc_ctx->width = static_cast<int>(width);
     impl->enc_ctx->height = static_cast<int>(height);
@@ -557,6 +671,10 @@ bool VideoEncoder::audio_enabled() const noexcept {
 int VideoEncoder::audio_frame_size() const noexcept {
     return (impl_->audio_enc_ctx && impl_->audio_enc_ctx->frame_size > 0)
         ? impl_->audio_enc_ctx->frame_size : 960;
+}
+
+Codec VideoEncoder::active_codec() const noexcept {
+    return impl_->cfg.codec;
 }
 
 EncoderStats VideoEncoder::stats() const noexcept {

@@ -55,32 +55,43 @@ layout(push_constant) uniform PushConstants {
     uvec2 dstExtent;    // Output video width, height (guaranteed even)
 } pc;
 
-// 5-tap Catmull-Rom bicubic sampling in source-pixel coordinates (zero divisions!)
-vec3 sampleCatmullRom(vec2 srcPx) {
-    vec2 texPos = srcPx - 0.5;
-    vec2 f = fract(texPos);
-    vec2 basePos = texPos - f;
+// Factored 1D Catmull-Rom weights and bilinear tap coordinates (computed twice per axis per 2x2 block)
+struct Cr1D {
+    float w0, w12, w3;
+    float tc0, tc12, tc3;
+};
 
-    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
-    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
-    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
-    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+Cr1D catmullRom1D(float srcCoord, float invSize) {
+    float texPos = srcCoord - 0.5;
+    float f = fract(texPos);
+    float basePos = texPos - f;
+    float f2 = f * f;
 
-    vec2 w12 = w1 + w2;
-    vec2 off12 = w2 / max(w12, vec2(1e-5));
+    float w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float w1 = 1.0 + f2 * (-2.5 + 1.5 * f);
+    float w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float w3 = f2 * (-0.5 + 0.5 * f);
 
-    vec2 tc0  = (basePos - 0.5) * pc.invSrcSize;
-    vec2 tc12 = (basePos + 0.5 + off12) * pc.invSrcSize;
-    vec2 tc3  = (basePos + 2.5) * pc.invSrcSize;
+    float w12 = w1 + w2;
+    float off12 = w2 / max(w12, 1e-5);
 
-    vec3 c = vec3(0.0);
-    c += textureLod(uSrc, vec2(tc12.x, tc0.y),  0.0).rgb * (w12.x * w0.y);
-    c += textureLod(uSrc, vec2(tc0.x,  tc12.y), 0.0).rgb * (w0.x  * w12.y);
-    c += textureLod(uSrc, vec2(tc12.x, tc12.y), 0.0).rgb * (w12.x * w12.y);
-    c += textureLod(uSrc, vec2(tc3.x,  tc12.y), 0.0).rgb * (w3.x  * w12.y);
-    c += textureLod(uSrc, vec2(tc12.x, tc3.y),  0.0).rgb * (w12.x * w3.y);
+    return Cr1D(
+        w0, w12, w3,
+        (basePos - 0.5) * invSize,
+        (basePos + 0.5 + off12) * invSize,
+        (basePos + 2.5) * invSize
+    );
+}
 
-    float wSum = w12.x * (w0.y + w12.y + w3.y) + (w0.x + w3.x) * w12.y;
+// 5-tap Catmull-Rom bicubic sampling using pre-factored 1D weights
+vec3 sampleCatmullRom2D(Cr1D x, Cr1D y) {
+    vec3 c = textureLod(uSrc, vec2(x.tc12, y.tc0),  0.0).rgb * (x.w12 * y.w0)
+           + textureLod(uSrc, vec2(x.tc0,  y.tc12), 0.0).rgb * (x.w0  * y.w12)
+           + textureLod(uSrc, vec2(x.tc12, y.tc12), 0.0).rgb * (x.w12 * y.w12)
+           + textureLod(uSrc, vec2(x.tc3,  y.tc12), 0.0).rgb * (x.w3  * y.w12)
+           + textureLod(uSrc, vec2(x.tc12, y.tc3),  0.0).rgb * (x.w12 * y.w3);
+
+    float wSum = x.w12 * (y.w0 + y.w12 + y.w3) + (x.w0 + x.w3) * y.w12;
     return clamp(c / max(wSum, 1e-5), 0.0, 1.0);
 }
 
@@ -97,15 +108,30 @@ vec3 blendCursor(vec3 baseRgb, vec2 srcPx) {
 
 // Piecewise sRGB EOTF -> 3x3 linear gamut matrix -> piecewise sRGB OETF.
 // Completely dead-code eliminated when kConvertGamut == false.
+// For 8-bit NV12, uses fast FMA/sqrt approximations (< 0.13 LSB error) instead of 24x pow().
 vec3 srgbToLinear(vec3 c) {
     vec3 lo = c * (1.0 / 12.92);
-    vec3 hi = pow(max((c + 0.055) * (1.0 / 1.055), vec3(0.0)), vec3(2.4));
+    vec3 t = max((c + 0.055) * (1.0 / 1.055), vec3(0.0));
+#if P010
+    vec3 hi = pow(t, vec3(2.4));
+#else
+    vec3 s = sqrt(t);
+    vec3 hi = t * t * (0.0725 + s * (1.0736 - 0.1461 * s));
+#endif
     return mix(lo, hi, greaterThan(c, vec3(0.04045)));
 }
 
 vec3 linearToSrgb(vec3 c) {
     vec3 lo = c * 12.92;
-    vec3 hi = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    vec3 cp = max(c, vec3(0.0));
+#if P010
+    vec3 hi = 1.055 * pow(cp, vec3(1.0 / 2.4)) - 0.055;
+#else
+    vec3 s1 = sqrt(cp);
+    vec3 s2 = sqrt(s1);
+    vec3 s3 = sqrt(s2);
+    vec3 hi = 0.662002687 * s1 + 0.684122060 * s2 - 0.323583601 * s3 - 0.0225411470 * cp;
+#endif
     return mix(lo, hi, greaterThan(c, vec3(0.0031308)));
 }
 
@@ -184,7 +210,8 @@ void main() {
         vec3 shufL1 = subgroupShuffleUp(rgb11, 1u);
 
         vec3 rgbL0, rgbL1;
-        if (gl_LocalInvocationID.x == 0u) {
+        // Also guard gl_SubgroupInvocationID == 0u for SIMD8 GPUs (e.g. Intel ANV)
+        if (gl_LocalInvocationID.x == 0u || gl_SubgroupInvocationID == 0u) {
             int lx = max(off.x + c00.x - 1, off.x);
             rgbL0 = texelFetch(uSrc, ivec2(lx, off.y + c00.y), 0).rgb;
             rgbL1 = texelFetch(uSrc, ivec2(lx, off.y + c01.y), 0).rgb;
@@ -217,18 +244,25 @@ void main() {
             return;
         }
         vec2 px00 = pc.srcBasePx + vec2(c00) * pc.srcStepPx;
-        vec2 px10 = vec2(px00.x + pc.srcStepPx.x, px00.y);
-        vec2 px01 = vec2(px00.x, px00.y + pc.srcStepPx.y);
         vec2 px11 = px00 + pc.srcStepPx;
-        rgb00 = sampleCatmullRom(px00);
-        rgb10 = sampleCatmullRom(px10);
-        rgb01 = sampleCatmullRom(px01);
-        rgb11 = sampleCatmullRom(px11);
+        Cr1D cx0 = catmullRom1D(px00.x, pc.invSrcSize.x);
+        Cr1D cx1 = catmullRom1D(px11.x, pc.invSrcSize.x);
+        Cr1D cy0 = catmullRom1D(px00.y, pc.invSrcSize.y);
+        Cr1D cy1 = catmullRom1D(px11.y, pc.invSrcSize.y);
+        rgb00 = sampleCatmullRom2D(cx0, cy0);
+        rgb10 = sampleCatmullRom2D(cx1, cy0);
+        rgb01 = sampleCatmullRom2D(cx0, cy1);
+        rgb11 = sampleCatmullRom2D(cx1, cy1);
         if (kHasCursor) {
-            rgb00 = blendCursor(rgb00, px00 - 0.5);
-            rgb10 = blendCursor(rgb10, px10 - 0.5);
-            rgb01 = blendCursor(rgb01, px01 - 0.5);
-            rgb11 = blendCursor(rgb11, px11 - 0.5);
+            vec2 p00 = px00 - 0.5;
+            vec2 p11 = px11 - 0.5;
+            if (p11.x >= pc.cursorRect.x && p00.x < pc.cursorRect.x + pc.cursorRect.z &&
+                p11.y >= pc.cursorRect.y && p00.y < pc.cursorRect.y + pc.cursorRect.w) {
+                rgb00 = blendCursor(rgb00, p00);
+                rgb10 = blendCursor(rgb10, vec2(p11.x, p00.y));
+                rgb01 = blendCursor(rgb01, vec2(p00.x, p11.y));
+                rgb11 = blendCursor(rgb11, p11);
+            }
         }
         if (kConvertGamut) {
             rgb00 = convertGamut(rgb00);
