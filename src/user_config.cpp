@@ -290,12 +290,19 @@ std::string format_config_summary(const Config &cfg) {
 
     std::string rc_str;
     RateControl eff_rc = cfg.rc;
-    if (eff_rc == RateControl::Auto) eff_rc = (cfg.bitrate > 0) ? RateControl::Vbr : RateControl::Cqp;
+    if (eff_rc == RateControl::Auto) {
+        eff_rc = (cfg.qp >= 0) ? RateControl::Cqp
+               : (cfg.bitrate > 0) ? RateControl::Vbr : RateControl::Cqp;
+    }
     if (eff_rc == RateControl::Cqp) {
         const int q = cfg.qp >= 0 ? cfg.qp : default_qp_for_codec(cfg.codec);
         rc_str = std::format("CQP {}", q);
     } else if (eff_rc == RateControl::Vbr) {
-        rc_str = std::format("VBR {:.1f}M", static_cast<double>(cfg.bitrate > 0 ? cfg.bitrate : 20'000'000) / 1e6);
+        const int64_t br = cfg.bitrate > 0 ? cfg.bitrate : 20'000'000;
+        const int64_t mbr = cfg.max_bitrate > 0 ? cfg.max_bitrate : (br * 3) / 2;
+        rc_str = std::format("VBR {:.1f}M (max {:.1f}M)",
+                             static_cast<double>(br) / 1e6,
+                             static_cast<double>(mbr) / 1e6);
     } else {
         rc_str = std::format("CBR {:.1f}M", static_cast<double>(cfg.bitrate > 0 ? cfg.bitrate : 20'000'000) / 1e6);
     }

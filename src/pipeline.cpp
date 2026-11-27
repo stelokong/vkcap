@@ -152,7 +152,8 @@ struct ScopedRawKeyReader {
 
 }  // namespace
 
-std::expected<void, std::string> run_kms_pipeline(const Config &cfg, PipelineSignals &signals) {
+std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, PipelineSignals &signals) {
+    Config cfg = in_cfg;
     auto &stop_flag = signals.stop;
 
     auto kms_res = KmsCapture::open(cfg);
@@ -191,6 +192,44 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, PipelineSig
     const uint32_t active_h = eff_crop.valid() ? static_cast<uint32_t>(eff_crop.height) : src_h;
     const uint32_t enc_w = cfg.out_width ? cfg.out_width : (active_w & ~1u);
     const uint32_t enc_h = cfg.out_height ? cfg.out_height : (active_h & ~1u);
+
+    // Tailor non-explicit profile parameters (codec, bitrate, FPS, QP, bit depth) to the
+    // actual output resolution, display refresh rate, and GPU Vulkan Video capabilities.
+    if (!cfg.from_saved_defaults) {
+        ProfileTarget target{};
+        target.width = enc_w;
+        target.height = enc_h;
+        target.refresh_hz = disp.refresh_hz;
+        if (auto gpu = probe_gpu_encode_support(cfg.device_index, cfg.device_explicit, disp.card_path); gpu.probed) {
+            target.has_av1 = gpu.has_av1;
+            target.has_hevc = gpu.has_hevc;
+            target.has_h264 = gpu.has_h264;
+            target.supports_10bit = gpu.supports_10bit;
+            target.supports_vbr = gpu.supports_vbr;
+            target.supports_cqp = gpu.supports_cqp;
+            target.supports_cbr = gpu.supports_cbr;
+            target.max_quality_levels = gpu.max_quality_levels;
+            target.max_coded_width = gpu.max_coded_width;
+            target.max_coded_height = gpu.max_coded_height;
+            target.max_hw_bitrate = gpu.max_hw_bitrate;
+        }
+        Config adapted{};
+        if (apply_profile(adapted, cfg.profile.empty() ? "default" : cfg.profile, target).has_value()) {
+            if (!cfg.fps_explicit) cfg.fps = adapted.fps;
+            if (!cfg.codec_explicit) cfg.codec = adapted.codec;
+            if (!cfg.pixfmt_explicit) cfg.pixfmt = adapted.pixfmt;
+            if (!cfg.quality_explicit) cfg.quality = adapted.quality;
+            if (!cfg.rc_explicit && !cfg.qp_explicit && !cfg.bitrate_explicit) {
+                cfg.rc = adapted.rc;
+                cfg.qp = adapted.qp;
+                cfg.bitrate = adapted.bitrate;
+                if (!cfg.max_bitrate_explicit) cfg.max_bitrate = adapted.max_bitrate;
+            } else if (!cfg.bitrate_explicit && (cfg.rc == RateControl::Vbr || cfg.rc == RateControl::Cbr)) {
+                cfg.bitrate = adapted.bitrate;
+                if (!cfg.max_bitrate_explicit) cfg.max_bitrate = adapted.max_bitrate;
+            }
+        }
+    }
 
     auto vk_res = VulkanCompute::create(cfg, gamut.enabled, gamut.matrix, disp.card_path);
     if (!vk_res) return std::unexpected(vk_res.error());

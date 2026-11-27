@@ -24,6 +24,28 @@ struct ComputeStats {
     uint64_t total_compute_ns = 0;
 };
 
+struct GpuEncodeSupport {
+    std::string device_name;
+    bool probed = false;
+    bool has_av1 = true;
+    bool has_hevc = true;
+    bool has_h264 = true;
+    bool supports_10bit = true;
+    bool supports_vbr = true;
+    bool supports_cqp = true;
+    bool supports_cbr = true;
+    uint32_t max_quality_levels = 2;
+    uint32_t max_coded_width = 0;
+    uint32_t max_coded_height = 0;
+    uint64_t max_hw_bitrate = 0;
+};
+
+/// Probes the target Vulkan GPU's hardware Vulkan Video encode extensions and quality levels
+/// without requiring elevated privileges (used for hardware-aware profile recommendations).
+GpuEncodeSupport probe_gpu_encode_support(uint32_t device_index = 0,
+                                          bool explicit_dev = false,
+                                          std::string_view drm_card_path = {});
+
 class VulkanCompute {
 public:
     VulkanCompute() = default;

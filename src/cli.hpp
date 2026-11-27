@@ -8,6 +8,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace vkcap {
 
@@ -53,9 +54,9 @@ struct Config {
     bool codec_explicit = false;  // True if user explicitly passed --codec
     PixelFormat pixfmt = PixelFormat::Nv12;
     RateControl rc = RateControl::Auto;
-    int qp = -1;              // -1 = codec-aware default (52 for AV1, 22 for HEVC/H264)
-    int64_t bitrate = 0;      // bps; 0 = unset
-    int64_t max_bitrate = 0;  // bps; 0 = unset
+    int qp = -1;              // -1 = unset (when --qp is passed with --rc=auto, selects CQP)
+    int64_t bitrate = 20'000'000;      // bps; default 20M VBR (foolproof bounded bitrate)
+    int64_t max_bitrate = 32'000'000;  // bps; default 32M VBR ceiling
     int quality = -1;         // -1 = auto default (clamped to GPU maxQualityLevels)
     Tune tune = Tune::Hq;
     Usage usage = Usage::Record;
@@ -73,6 +74,36 @@ struct Config {
     size_t queue_size = 4;
     bool verbose = false;
     bool show_help = false;
+
+    // Tracks explicit user CLI overrides so hardware-aware profile adaptation
+    // never clobbers an explicitly requested flag or saved user defaults.
+    bool fps_explicit = false;
+    bool pixfmt_explicit = false;
+    bool rc_explicit = false;
+    bool qp_explicit = false;
+    bool bitrate_explicit = false;
+    bool max_bitrate_explicit = false;
+    bool quality_explicit = false;
+    bool from_saved_defaults = false;
+};
+
+struct ProfileTarget {
+    uint32_t width = 2560;
+    uint32_t height = 1440;
+    double refresh_hz = 144.0;
+    bool has_av1 = true;
+    bool has_hevc = true;
+    bool has_h264 = true;
+    bool supports_10bit = true;
+    bool supports_vbr = true;
+    bool supports_cqp = true;
+    bool supports_cbr = true;
+    uint32_t max_quality_levels = 2;
+    uint32_t max_coded_width = 0;
+    uint32_t max_coded_height = 0;
+    uint64_t max_hw_bitrate = 0;
+    std::string gpu_name;
+    std::string display_label;
 };
 
 struct ProfileInfo {
@@ -81,9 +112,24 @@ struct ProfileInfo {
     std::string_view details;
 };
 
+struct AdaptiveProfileInfo {
+    std::string name;
+    std::string summary;
+    std::string details;
+};
+
+Codec best_codec_for(const ProfileTarget &target) noexcept;
+uint32_t recommended_standard_fps(double refresh_hz) noexcept;
+uint32_t recommended_gameplay_fps(double refresh_hz) noexcept;
+int64_t recommended_bitrate(uint32_t width, uint32_t height, uint32_t fps,
+                            Codec codec, PixelFormat pixfmt, double base_1440p60_mbps,
+                            uint64_t max_hw_bitrate = 0) noexcept;
+
 std::span<const ProfileInfo> builtin_profiles() noexcept;
-std::expected<void, std::string> apply_profile(Config &cfg, std::string_view name);
-void print_profiles();
+std::vector<AdaptiveProfileInfo> describe_profiles(const ProfileTarget &target);
+std::expected<void, std::string> apply_profile(Config &cfg, std::string_view name,
+                                               const ProfileTarget &target = {});
+void print_profiles(const ProfileTarget &target = {});
 
 std::expected<Config, std::string> parse_args(int argc, char **argv, const Config *base_defaults = nullptr);
 std::expected<int64_t, std::string> parse_bitrate(const std::string &str);

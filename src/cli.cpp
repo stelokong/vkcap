@@ -4,6 +4,7 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <ctime>
 #include <format>
@@ -16,20 +17,20 @@ namespace vkcap {
 namespace {
 
 constexpr std::array<ProfileInfo, 7> kProfiles = {{
-    {"default",        "Near-native quality, low overhead (RDNA 4 default)",
-                       "60 fps | AV1 | 8-bit NV12 + IGN dither | CQP 52 | quality 1 | hq"},
+    {"default",        "Near-native quality, bounded bitrate (recommended default)",
+                       "60 fps | AV1 | 8-bit NV12 + IGN dither | VBR 20M (max 32M) | quality 1 | hq"},
     {"gameplay",       "High-framerate 120 fps gameplay capture",
-                       "120 fps | AV1 | 8-bit NV12 + IGN dither | CQP 56 | quality 1 | hq"},
-    {"gameplay-10bit", "120 fps 10-bit gameplay (zero banding, 35 Mbps VBR)",
-                       "120 fps | AV1 | 10-bit P010 | VBR 35M (max 52.5M) | quality 1 | hq"},
-    {"master",         "Archival / editing master (10-bit, ultra-high quality)",
+                       "120 fps | AV1 | 8-bit NV12 + IGN dither | VBR 35M (max 55M) | quality 1 | hq"},
+    {"gameplay-10bit", "120 fps 10-bit gameplay (zero banding, 40 Mbps VBR)",
+                       "120 fps | AV1 | 10-bit P010 | VBR 40M (max 60M) | quality 1 | hq"},
+    {"master",         "Archival / editing master (10-bit, uncapped CQP)",
                        "60 fps | AV1 | 10-bit P010 | CQP 36 | quality 1 | hq"},
     {"compact",        "Small file sizes for Discord / sharing / long sessions",
-                       "60 fps | AV1 | 8-bit NV12 + IGN dither | CQP 78 | 4s GOP | hq"},
+                       "60 fps | AV1 | 8-bit NV12 + IGN dither | VBR 8M (max 12M) | 4s GOP | hq"},
     {"desktop",        "Crisp desktop UI, text, and tutorials at low bitrate",
                        "60 fps | AV1 | 8-bit NV12 + IGN dither | CQP 62 | 4s GOP | desktop"},
     {"low-latency",    "Minimum GPU/VCN footprint for maximum game FPS",
-                       "60 fps | AV1 | 8-bit NV12 + IGN dither | CQP 64 | quality 0 | ll | async 2"},
+                       "60 fps | AV1 | 8-bit NV12 + IGN dither | VBR 18M (max 28M) | quality 0 | ll | async 2"},
 }};
 
 std::string to_lower_copy(std::string_view sv) {
@@ -45,17 +46,120 @@ std::span<const ProfileInfo> builtin_profiles() noexcept {
     return kProfiles;
 }
 
-std::expected<void, std::string> apply_profile(Config &cfg, std::string_view name) {
-    const std::string key = to_lower_copy(name);
-    if (key.empty() || key == "default" || key == "balanced") {
-        cfg.profile = "default";
-        cfg.fps = 60;
-        cfg.codec = Codec::Av1;
-        cfg.pixfmt = PixelFormat::Nv12;
-        cfg.rc = RateControl::Auto;
+Codec best_codec_for(const ProfileTarget &target) noexcept {
+    if (target.has_av1) return Codec::Av1;
+    if (target.has_hevc) return Codec::Hevc;
+    return Codec::H264;
+}
+
+uint32_t recommended_standard_fps(double refresh_hz) noexcept {
+    if (refresh_hz <= 0.0) return 60;
+    // Treat 59.94 / 59.998 / 60+ Hz panels as 60 fps standard; only step down
+    // when the panel genuinely refreshes below 58 Hz (e.g. 29.97/30 Hz, 48 Hz, 50 Hz).
+    if (refresh_hz >= 58.0) return 60;
+    return static_cast<uint32_t>(std::clamp<long long>(std::llround(refresh_hz), 15, 60));
+}
+
+uint32_t recommended_gameplay_fps(double refresh_hz) noexcept {
+    if (refresh_hz <= 0.0) return 120;
+    // Account for fractional NTSC/VESA refresh rates (119.88 -> 120, 89.9 -> 90, 74.97 -> 75)
+    if (refresh_hz >= 118.0) return 120;
+    if (refresh_hz >= 88.0) return 90;
+    if (refresh_hz >= 73.0) return 75;
+    return recommended_standard_fps(refresh_hz);
+}
+
+int64_t recommended_bitrate(uint32_t width, uint32_t height, uint32_t fps,
+                            Codec codec, PixelFormat pixfmt, double base_1440p60_mbps,
+                            uint64_t max_hw_bitrate) noexcept {
+    constexpr double kRefPixels = 2560.0 * 1440.0;
+    const double pixels = std::max(320.0 * 240.0, static_cast<double>(width) * static_cast<double>(height));
+    const double res_scale = std::pow(pixels / kRefPixels, 0.75);
+    const double fps_scale = std::pow(static_cast<double>(std::max<uint32_t>(1u, fps)) / 60.0, 0.75);
+    const double codec_scale = (codec == Codec::Av1) ? 1.0
+                             : (codec == Codec::Hevc) ? 1.20 : 1.55;
+    const double depth_scale = (pixfmt == PixelFormat::P010) ? 1.15 : 1.0;
+
+    const double raw_mbps = base_1440p60_mbps * res_scale * fps_scale * codec_scale * depth_scale;
+    int64_t bps = std::max<int64_t>(2, static_cast<int64_t>(std::llround(raw_mbps))) * 1'000'000LL;
+    if (max_hw_bitrate > 0 && static_cast<uint64_t>(bps) > max_hw_bitrate) {
+        bps = std::max<int64_t>(1'000'000LL, static_cast<int64_t>(max_hw_bitrate));
+    }
+    return bps;
+}
+
+namespace {
+
+int64_t round_mbps(double mbps, uint64_t max_hw_bitrate = 0) noexcept {
+    int64_t bps = std::max<int64_t>(2, static_cast<int64_t>(std::llround(mbps))) * 1'000'000LL;
+    if (max_hw_bitrate > 0 && static_cast<uint64_t>(bps) > max_hw_bitrate) {
+        bps = std::max<int64_t>(1'000'000LL, static_cast<int64_t>(max_hw_bitrate));
+    }
+    return bps;
+}
+
+const char *codec_label(Codec c) noexcept {
+    switch (c) {
+        case Codec::Av1:  return "AV1";
+        case Codec::Hevc: return "HEVC";
+        case Codec::H264: return "H.264";
+    }
+    return "AV1";
+}
+
+void apply_vbr_or_fallback(Config &cfg, const ProfileTarget &target,
+                           double base_1440p60_mbps, double max_mult,
+                           int fallback_av1_qp, int fallback_other_qp) noexcept {
+    if (target.supports_vbr) {
+        cfg.rc = RateControl::Vbr;
         cfg.qp = -1;
+        cfg.bitrate = recommended_bitrate(target.width, target.height, cfg.fps, cfg.codec,
+                                          cfg.pixfmt, base_1440p60_mbps, target.max_hw_bitrate);
+        cfg.max_bitrate = round_mbps((static_cast<double>(cfg.bitrate) / 1e6) * max_mult,
+                                     target.max_hw_bitrate);
+    } else if (target.supports_cqp) {
+        cfg.rc = RateControl::Cqp;
+        cfg.qp = (cfg.codec == Codec::Av1) ? fallback_av1_qp : fallback_other_qp;
         cfg.bitrate = 0;
         cfg.max_bitrate = 0;
+    } else {
+        cfg.rc = RateControl::Cbr;
+        cfg.qp = -1;
+        cfg.bitrate = recommended_bitrate(target.width, target.height, cfg.fps, cfg.codec,
+                                          cfg.pixfmt, base_1440p60_mbps, target.max_hw_bitrate);
+        cfg.max_bitrate = 0;
+    }
+}
+
+void apply_cqp_or_fallback(Config &cfg, const ProfileTarget &target,
+                           int av1_qp, int other_qp, double fallback_1440p60_mbps) noexcept {
+    if (target.supports_cqp) {
+        cfg.rc = RateControl::Cqp;
+        cfg.qp = (cfg.codec == Codec::Av1) ? av1_qp : other_qp;
+        cfg.bitrate = 0;
+        cfg.max_bitrate = 0;
+    } else {
+        apply_vbr_or_fallback(cfg, target, fallback_1440p60_mbps, 1.50, av1_qp, other_qp);
+    }
+}
+
+}  // namespace
+
+std::expected<void, std::string> apply_profile(Config &cfg, std::string_view name, const ProfileTarget &target) {
+    const std::string key = to_lower_copy(name);
+    const Codec best_c = best_codec_for(target);
+    const bool supports_10bit = target.supports_10bit && (best_c == Codec::Av1 || best_c == Codec::Hevc);
+    const int max_q = static_cast<int>(std::max<uint32_t>(1u, target.max_quality_levels)) - 1;
+    const int std_q = std::min(1, max_q);
+    const uint32_t std_fps = recommended_standard_fps(target.refresh_hz);
+    const uint32_t gp_fps = recommended_gameplay_fps(target.refresh_hz);
+
+    if (key.empty() || key == "default" || key == "balanced") {
+        cfg.profile = "default";
+        cfg.fps = std_fps;
+        cfg.codec = best_c;
+        cfg.pixfmt = PixelFormat::Nv12;
+        apply_vbr_or_fallback(cfg, target, 20.0, 1.60, 52, 22);
         cfg.quality = -1;
         cfg.tune = Tune::Hq;
         cfg.usage = Usage::Record;
@@ -68,14 +172,11 @@ std::expected<void, std::string> apply_profile(Config &cfg, std::string_view nam
     }
     if (key == "gameplay") {
         cfg.profile = "gameplay";
-        cfg.fps = 120;
-        cfg.codec = Codec::Av1;
+        cfg.fps = gp_fps;
+        cfg.codec = best_c;
         cfg.pixfmt = PixelFormat::Nv12;
-        cfg.rc = RateControl::Cqp;
-        cfg.qp = 56;
-        cfg.bitrate = 0;
-        cfg.max_bitrate = 0;
-        cfg.quality = 1;
+        apply_vbr_or_fallback(cfg, target, 20.8, 1.57, 56, 24);
+        cfg.quality = std_q;
         cfg.tune = Tune::Hq;
         cfg.usage = Usage::Record;
         cfg.content = Content::Rendered;
@@ -87,54 +188,47 @@ std::expected<void, std::string> apply_profile(Config &cfg, std::string_view nam
     }
     if (key == "gameplay-10bit" || key == "gameplay10") {
         cfg.profile = "gameplay-10bit";
-        cfg.fps = 120;
-        cfg.codec = Codec::Av1;
-        cfg.pixfmt = PixelFormat::P010;
-        cfg.rc = RateControl::Vbr;
-        cfg.qp = -1;
-        cfg.bitrate = 35'000'000;
-        cfg.max_bitrate = 52'500'000;
-        cfg.quality = 1;
+        cfg.fps = gp_fps;
+        cfg.codec = best_c;
+        cfg.pixfmt = supports_10bit ? PixelFormat::P010 : PixelFormat::Nv12;
+        apply_vbr_or_fallback(cfg, target, 20.7, 1.50, 52, 22);
+        cfg.quality = std_q;
         cfg.tune = Tune::Hq;
         cfg.usage = Usage::Record;
         cfg.content = Content::Rendered;
         cfg.idr_interval = 0;
         cfg.async_depth = 4;
         cfg.b_depth = 1;
+        cfg.dither = (cfg.pixfmt == PixelFormat::Nv12);
         return {};
     }
     if (key == "master" || key == "archival") {
         cfg.profile = "master";
-        cfg.fps = 60;
-        cfg.codec = Codec::Av1;
-        cfg.pixfmt = PixelFormat::P010;
-        cfg.rc = RateControl::Cqp;
-        cfg.qp = 36;
-        cfg.bitrate = 0;
-        cfg.max_bitrate = 0;
-        cfg.quality = 1;
+        cfg.fps = std_fps;
+        cfg.codec = best_c;
+        cfg.pixfmt = supports_10bit ? PixelFormat::P010 : PixelFormat::Nv12;
+        apply_cqp_or_fallback(cfg, target, 36, 18, 45.0);
+        cfg.quality = std_q;
         cfg.tune = Tune::Hq;
         cfg.usage = Usage::Record;
         cfg.content = Content::Rendered;
         cfg.idr_interval = 0;
         cfg.async_depth = 4;
         cfg.b_depth = 1;
+        cfg.dither = (cfg.pixfmt == PixelFormat::Nv12);
         return {};
     }
     if (key == "compact" || key == "small") {
         cfg.profile = "compact";
-        cfg.fps = 60;
-        cfg.codec = Codec::Av1;
+        cfg.fps = std_fps;
+        cfg.codec = best_c;
         cfg.pixfmt = PixelFormat::Nv12;
-        cfg.rc = RateControl::Cqp;
-        cfg.qp = 78;
-        cfg.bitrate = 0;
-        cfg.max_bitrate = 0;
-        cfg.quality = 1;
+        apply_vbr_or_fallback(cfg, target, 8.0, 1.50, 78, 30);
+        cfg.quality = std_q;
         cfg.tune = Tune::Hq;
         cfg.usage = Usage::Record;
         cfg.content = Content::Rendered;
-        cfg.idr_interval = 240;  // 4 seconds @ 60fps
+        cfg.idr_interval = static_cast<int>(cfg.fps * 4u);  // 4-second GOP
         cfg.async_depth = 4;
         cfg.b_depth = 1;
         cfg.dither = true;
@@ -142,18 +236,15 @@ std::expected<void, std::string> apply_profile(Config &cfg, std::string_view nam
     }
     if (key == "desktop" || key == "ui") {
         cfg.profile = "desktop";
-        cfg.fps = 60;
-        cfg.codec = Codec::Av1;
+        cfg.fps = std_fps;
+        cfg.codec = best_c;
         cfg.pixfmt = PixelFormat::Nv12;
-        cfg.rc = RateControl::Cqp;
-        cfg.qp = 62;
-        cfg.bitrate = 0;
-        cfg.max_bitrate = 0;
-        cfg.quality = 1;
+        apply_cqp_or_fallback(cfg, target, 62, 26, 12.0);
+        cfg.quality = std_q;
         cfg.tune = Tune::Hq;
         cfg.usage = Usage::Record;
         cfg.content = Content::Desktop;
-        cfg.idr_interval = 240;  // 4 seconds @ 60fps
+        cfg.idr_interval = static_cast<int>(cfg.fps * 4u);  // 4-second GOP
         cfg.async_depth = 4;
         cfg.b_depth = 1;
         cfg.dither = true;
@@ -161,13 +252,10 @@ std::expected<void, std::string> apply_profile(Config &cfg, std::string_view nam
     }
     if (key == "low-latency" || key == "ll" || key == "light") {
         cfg.profile = "low-latency";
-        cfg.fps = 60;
-        cfg.codec = Codec::Av1;
+        cfg.fps = std_fps;
+        cfg.codec = best_c;
         cfg.pixfmt = PixelFormat::Nv12;
-        cfg.rc = RateControl::Cqp;
-        cfg.qp = 64;
-        cfg.bitrate = 0;
-        cfg.max_bitrate = 0;
+        apply_vbr_or_fallback(cfg, target, 18.0, 1.56, 64, 26);
         cfg.quality = 0;
         cfg.tune = Tune::Ll;
         cfg.usage = Usage::Record;
@@ -181,9 +269,46 @@ std::expected<void, std::string> apply_profile(Config &cfg, std::string_view nam
     return std::unexpected(std::format("Unknown profile '{}'. Run with --list-profiles to see available profiles.", name));
 }
 
-void print_profiles() {
-    std::cout << "Available premade profiles (use with -p <name>; explicit flags override profile values):\n\n";
+std::vector<AdaptiveProfileInfo> describe_profiles(const ProfileTarget &target) {
+    std::vector<AdaptiveProfileInfo> out;
+    out.reserve(kProfiles.size());
     for (const auto &p : kProfiles) {
+        Config c{};
+        (void)apply_profile(c, p.name, target);
+        std::string rc_desc = (c.rc == RateControl::Cqp)
+            ? std::format("CQP {}", c.qp)
+            : (c.rc == RateControl::Cbr)
+                ? std::format("CBR {}M", c.bitrate / 1'000'000)
+                : std::format("VBR {}M (max {}M)", c.bitrate / 1'000'000, c.max_bitrate / 1'000'000);
+        const char *fmt_desc = (c.pixfmt == PixelFormat::P010) ? "10-bit P010" : "8-bit NV12 + IGN";
+        const int eff_q = (c.quality >= 0) ? c.quality
+            : (static_cast<int>(std::max<uint32_t>(1u, target.max_quality_levels)) > 1 ? 1 : 0);
+        std::string extra;
+        if (c.idr_interval > 0 && c.idr_interval == static_cast<int>(c.fps * 4u)) extra += " | 4s GOP";
+        if (c.content == Content::Desktop) extra += " | desktop";
+        else if (c.tune == Tune::Ll) extra += std::format(" | quality {} | ll | async {}", eff_q, c.async_depth);
+        else extra += std::format(" | quality {} | hq", eff_q);
+
+        out.push_back({
+            std::string(p.name),
+            std::string(p.summary),
+            std::format("{} fps | {} | {} | {}{}", c.fps, codec_label(c.codec), fmt_desc, rc_desc, extra),
+        });
+    }
+    return out;
+}
+
+void print_profiles(const ProfileTarget &target) {
+    std::cout << "Available adaptive profiles (use with -p <name>; explicit flags override):\n";
+    if (!target.display_label.empty() || !target.gpu_name.empty()) {
+        std::cout << std::format("  Tailored for: {}{}{}{}\n",
+                                 target.display_label.empty() ? std::format("{}x{}@{:.0f}Hz", target.width, target.height, target.refresh_hz) : target.display_label,
+                                 target.gpu_name.empty() ? "" : " | ",
+                                 target.gpu_name,
+                                 std::format(" ({})", codec_label(best_codec_for(target))));
+    }
+    std::cout << '\n';
+    for (const auto &p : describe_profiles(target)) {
         std::cout << std::format("  {:<15} {}\n                  [{}]\n", p.name, p.summary, p.details);
     }
 }
@@ -331,10 +456,10 @@ Audio Capture (PipeWire low-latency, system audio ON by default):
 Vulkan Video Encoder (AV1 primary, tuned for RDNA 4 / VCN 5):
       --codec <name>          av1, hevc, h264 [default: av1]
       --pixfmt <fmt>          nv12 (8-bit + IGN dither) or p010 (10-bit) [default: nv12]
-      --rc <mode>             Rate control: auto, cqp, cbr, vbr [default: auto]
-      --qp <n>                Quantizer for CQP (0..255 for AV1 [52], 0..51 for HEVC/H264 [22])
-  -b, --bitrate <rate>        Target bitrate (e.g. 20M, 35M); selects VBR if --rc=auto
-      --max-bitrate <rate>    Max bitrate for VBR mode
+      --rc <mode>             Rate control: auto, vbr, cqp, cbr [default: auto (VBR 20M/32M)]
+      --qp <n>                Quantizer for CQP (0..255 for AV1 [52], 0..51 for HEVC/H264 [22]; selects CQP if --rc=auto)
+  -b, --bitrate <rate>        Target bitrate (e.g. 20M, 35M) [default: 20M]
+      --max-bitrate <rate>    Max bitrate for VBR mode [default: 32M or 1.5x bitrate]
       --quality <0..3>        Encoder quality level (higher = slower) [default: auto (1)]
       --tune <mode>           default, hq, ll, ull, lossless [default: hq]
       --usage <mode>          default, transcode, stream, record, conference [default: record]
@@ -411,6 +536,7 @@ std::expected<Config, std::string> parse_args(int argc, char **argv, const Confi
     // explicit -d on the command line will still set it below.
     if (base_defaults) {
         cfg.duration_sec = 0.0;
+        cfg.from_saved_defaults = true;
     }
 
     // Pre-scan for -p / --profile so explicit CLI flags always override profile settings
@@ -501,6 +627,7 @@ std::expected<Config, std::string> parse_args(int argc, char **argv, const Confi
                 auto r = parse_int(optarg, 1, 1000, "--fps");
                 if (!r) return std::unexpected(r.error());
                 cfg.fps = static_cast<uint32_t>(*r);
+                cfg.fps_explicit = true;
                 break;
             }
             case 's': {
@@ -524,6 +651,9 @@ std::expected<Config, std::string> parse_args(int argc, char **argv, const Confi
                 auto r = parse_bitrate(optarg);
                 if (!r) return std::unexpected(r.error());
                 cfg.bitrate = *r;
+                cfg.bitrate_explicit = true;
+                // Reset default max_bitrate so 1.5x scaling applies unless --max-bitrate is also passed
+                if (!cfg.max_bitrate_explicit) cfg.max_bitrate = 0;
                 break;
             }
             case 'v': cfg.verbose = true; break;
@@ -591,6 +721,7 @@ std::expected<Config, std::string> parse_args(int argc, char **argv, const Confi
                 auto r = parse_enum<PixelFormat>(optarg, {{"nv12", PixelFormat::Nv12}, {"p010", PixelFormat::P010}}, "--pixfmt");
                 if (!r) return std::unexpected(r.error());
                 cfg.pixfmt = *r;
+                cfg.pixfmt_explicit = true;
                 break;
             }
             case OPT_RC: {
@@ -599,24 +730,28 @@ std::expected<Config, std::string> parse_args(int argc, char **argv, const Confi
                     {"cbr", RateControl::Cbr}, {"vbr", RateControl::Vbr}}, "--rc");
                 if (!r) return std::unexpected(r.error());
                 cfg.rc = *r;
+                cfg.rc_explicit = true;
                 break;
             }
             case OPT_QP: {
                 auto r = parse_int(optarg, 0, 255, "--qp");
                 if (!r) return std::unexpected(r.error());
                 cfg.qp = *r;
+                cfg.qp_explicit = true;
                 break;
             }
             case OPT_MAX_BITRATE: {
                 auto r = parse_bitrate(optarg);
                 if (!r) return std::unexpected(r.error());
                 cfg.max_bitrate = *r;
+                cfg.max_bitrate_explicit = true;
                 break;
             }
             case OPT_QUALITY: {
                 auto r = parse_int(optarg, 0, 16, "--quality");
                 if (!r) return std::unexpected(r.error());
                 cfg.quality = *r;
+                cfg.quality_explicit = true;
                 break;
             }
             case OPT_TUNE: {

@@ -1,6 +1,7 @@
 #include "interactive.hpp"
 #include "audio_capture.hpp"
 #include "kms_capture.hpp"
+#include "vulkan_compute.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -434,10 +435,36 @@ std::expected<bool, std::string> run_interactive_setup(
     size_t disp_idx = 0;
     if (!prompt_display(in, out, disps, disp_idx, cfg.display)) return false;
 
+    // Probe target display + GPU capabilities so profile & advanced defaults are tailored to this system
+    const auto &sel_disp = disps[disp_idx];
+    ProfileTarget target{};
+    target.width = sel_disp.width;
+    target.height = sel_disp.height;
+    target.refresh_hz = sel_disp.refresh_hz;
+    target.display_label = std::format("{} {}x{}@{:.0f}Hz",
+                                       sel_disp.connector_name, sel_disp.width, sel_disp.height, sel_disp.refresh_hz);
+    if (auto gpu = probe_gpu_encode_support(cfg.device_index, cfg.device_explicit, sel_disp.card_path); gpu.probed) {
+        target.has_av1 = gpu.has_av1;
+        target.has_hevc = gpu.has_hevc;
+        target.has_h264 = gpu.has_h264;
+        target.supports_10bit = gpu.supports_10bit;
+        target.supports_vbr = gpu.supports_vbr;
+        target.supports_cqp = gpu.supports_cqp;
+        target.supports_cbr = gpu.supports_cbr;
+        target.max_quality_levels = gpu.max_quality_levels;
+        target.max_coded_width = gpu.max_coded_width;
+        target.max_coded_height = gpu.max_coded_height;
+        target.max_hw_bitrate = gpu.max_hw_bitrate;
+        target.gpu_name = gpu.device_name;
+    }
+
     if (mode == 1) {
-        // --- Quick Setup: Profile defines video/encoder parameters ---
-        const auto profiles = builtin_profiles();
-        out << "Select recording profile (defines FPS, codec, quality & rate control):\n";
+        // --- Quick Setup: Adaptive profile tailored to selected display & GPU ---
+        const auto profiles = describe_profiles(target);
+        out << std::format("Select recording profile (tailored for {}{}{}):\n",
+                           target.display_label,
+                           target.gpu_name.empty() ? "" : " | ",
+                           target.gpu_name);
         for (size_t i = 0; i < profiles.size(); ++i) {
             out << std::format("   [{}] {:<15} {}\n       ({})\n",
                                i + 1, profiles[i].name, profiles[i].summary, profiles[i].details);
@@ -453,38 +480,53 @@ std::expected<bool, std::string> run_interactive_setup(
                 prof_idx = n - 1;
                 break;
             }
-            if (apply_profile(cfg, ans).has_value()) {
+            if (apply_profile(cfg, ans, target).has_value()) {
                 prof_idx = profiles.size();
                 break;
             }
             out << std::format("   Please enter 1..{} or a profile name.\n", profiles.size());
         }
         if (prof_idx < profiles.size()) {
-            (void)apply_profile(cfg, profiles[prof_idx].name);
+            (void)apply_profile(cfg, profiles[prof_idx].name, target);
         }
         out << "\nSession options (not set by profile):\n";
         if (!prompt_audio_section(in, out, cfg, false)) return false;
         if (!prompt_yes_no(in, out, "Capture hardware mouse cursor? [Y/n]: ", true, cfg.capture_cursor)) return false;
         if (!prompt_resolution_and_output(in, out, disps[disp_idx], cfg)) return false;
+        // If user chose a scaled resolution in Quick Setup, re-tailor the profile's bitrate to the scaled size
+        if (cfg.out_width > 0 && cfg.out_height > 0 && !cfg.profile.empty()) {
+            ProfileTarget scaled_target = target;
+            scaled_target.width = cfg.out_width;
+            scaled_target.height = cfg.out_height;
+            Config re{};
+            if (apply_profile(re, cfg.profile, scaled_target).has_value() && re.rc == RateControl::Vbr) {
+                cfg.bitrate = re.bitrate;
+                cfg.max_bitrate = re.max_bitrate;
+            }
+        }
     } else {
-        // --- Advanced Setup: Configure every parameter ---
+        // --- Advanced Setup: Configure every parameter (hardware-aware defaults) ---
         cfg.profile.clear();  // Custom advanced configuration (does not touch any profile)
 
+        const Codec rec_codec = best_codec_for(target);
+        const size_t def_codec_idx = (rec_codec == Codec::Av1) ? 0 : (rec_codec == Codec::Hevc ? 1 : 2);
         out << "-- Video Codec & Format --\n";
         if (!prompt_choice<Codec>(in, out, "Video codec:", {
-                {"av1  (recommended for RDNA 4 / VCN 5)", Codec::Av1},
-                {"hevc (H.265)", Codec::Hevc},
-                {"h264 (AVC)", Codec::H264},
-            }, 0, cfg.codec)) return false;
+                {target.has_av1  ? "av1  (supported on this GPU)" : "av1  (not advertised by this GPU)", Codec::Av1},
+                {target.has_hevc ? "hevc (H.265 — supported on this GPU)" : "hevc (H.265 — not advertised)", Codec::Hevc},
+                {target.has_h264 ? "h264 (AVC — supported on this GPU)" : "h264 (AVC — not advertised)", Codec::H264},
+            }, def_codec_idx, cfg.codec)) return false;
         cfg.codec_explicit = true;
 
+        const bool p010_ok = target.supports_10bit && (cfg.codec == Codec::Av1 || cfg.codec == Codec::Hevc);
         if (!prompt_choice<PixelFormat>(in, out, "Pixel format:", {
                 {"nv12 (8-bit + static IGN dithering)", PixelFormat::Nv12},
-                {"p010 (10-bit, zero banding)", PixelFormat::P010},
+                {p010_ok ? "p010 (10-bit, zero banding)" : "p010 (10-bit — not advertised by this GPU/codec)", PixelFormat::P010},
             }, 0, cfg.pixfmt)) return false;
 
-        int fps_val = 60;
-        if (!prompt_int(in, out, "Framerate (FPS)", 60, 1, 1000, fps_val)) return false;
+        const int def_fps = static_cast<int>(recommended_standard_fps(sel_disp.refresh_hz));
+        int fps_val = def_fps;
+        if (!prompt_int(in, out, "Framerate (FPS)", def_fps, 1, 1000, fps_val)) return false;
         cfg.fps = static_cast<uint32_t>(fps_val);
 
         if (!prompt_yes_no(in, out, "Capture hardware mouse cursor? [Y/n]: ", true, cfg.capture_cursor)) return false;
@@ -505,11 +547,12 @@ std::expected<bool, std::string> run_interactive_setup(
         }
 
         out << "\n-- Rate Control & Encoder Tuning --\n";
+        const size_t def_rc_idx = target.supports_vbr ? 0 : (target.supports_cqp ? 1 : 2);
         if (!prompt_choice<RateControl>(in, out, "Rate control mode:", {
-                {"cqp (constant quality — recommended)", RateControl::Cqp},
-                {"vbr (variable bitrate)", RateControl::Vbr},
-                {"cbr (constant bitrate)", RateControl::Cbr},
-            }, 0, cfg.rc)) return false;
+                {target.supports_vbr ? "vbr (variable bitrate — recommended, prevents bitrate spikes)" : "vbr (not advertised by this GPU)", RateControl::Vbr},
+                {target.supports_cqp ? "cqp (constant quality — uncapped bitrate, best for archival/desktop)" : "cqp (not advertised by this GPU)", RateControl::Cqp},
+                {target.supports_cbr ? "cbr (constant bitrate)" : "cbr (not advertised by this GPU)", RateControl::Cbr},
+            }, def_rc_idx, cfg.rc)) return false;
 
         if (cfg.rc == RateControl::Cqp) {
             const int def_qp = default_qp_for_codec(cfg.codec);
@@ -523,10 +566,15 @@ std::expected<bool, std::string> run_interactive_setup(
             cfg.max_bitrate = 0;
         } else {
             cfg.qp = -1;
+            const int64_t def_br = recommended_bitrate(
+                sel_disp.width, sel_disp.height, cfg.fps, cfg.codec, cfg.pixfmt, 20.0, target.max_hw_bitrate);
+            const std::string def_br_label = std::format("{}M", def_br / 1'000'000);
             std::string ans;
             while (true) {
-                if (!prompt_line(in, out, "Target bitrate (e.g. 20M, 35M) [25M]: ", ans)) return false;
-                if (ans.empty()) { cfg.bitrate = 25'000'000; break; }
+                if (!prompt_line(in, out,
+                                 std::format("Target bitrate (e.g. 20M, 35M) [{}]: ", def_br_label),
+                                 ans)) return false;
+                if (ans.empty()) { cfg.bitrate = def_br; break; }
                 auto r = parse_bitrate(ans);
                 if (r) { cfg.bitrate = *r; break; }
                 out << "   " << r.error() << '\n';
@@ -544,7 +592,11 @@ std::expected<bool, std::string> run_interactive_setup(
             }
         }
 
-        if (!prompt_int(in, out, "Encoder quality level (0..3, 1 = RDNA 4 sweet spot)", 1, 0, 3, cfg.quality)) return false;
+        const int max_q = static_cast<int>(std::max<uint32_t>(1u, target.max_quality_levels)) - 1;
+        const int def_q = std::min(1, max_q);
+        if (!prompt_int(in, out,
+                        std::format("Encoder quality level (0..{}, higher = slower)", std::max(max_q, 3)),
+                        def_q, 0, std::max(max_q, 3), cfg.quality)) return false;
 
         if (!prompt_choice<Tune>(in, out, "Encoder tune:", {
                 {"hq       (high quality)", Tune::Hq},
@@ -630,6 +682,7 @@ std::expected<bool, std::string> run_interactive_setup(
             out << "Saved personal defaults to " << defaults_path.string() << '\n';
         }
     }
+    cfg.from_saved_defaults = true;  // Interactive choices are already finalized for this target
     out << '\n';
     return true;
 }

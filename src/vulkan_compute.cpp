@@ -183,6 +183,127 @@ uint32_t resolve_vulkan_device_index(uint32_t default_idx, bool explicit_dev, st
 
 }  // namespace
 
+GpuEncodeSupport probe_gpu_encode_support(uint32_t device_index,
+                                          bool explicit_dev,
+                                          std::string_view drm_card_path) {
+    GpuEncodeSupport out{};
+    const uint32_t target_idx = resolve_vulkan_device_index(device_index, explicit_dev, drm_card_path);
+
+    VkApplicationInfo app{};
+    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.apiVersion = VK_API_VERSION_1_3;
+    VkInstanceCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    ici.pApplicationInfo = &app;
+
+    VkInstance inst = VK_NULL_HANDLE;
+    if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS || !inst) {
+        return out;
+    }
+
+    uint32_t dev_count = 0;
+    if (vkEnumeratePhysicalDevices(inst, &dev_count, nullptr) == VK_SUCCESS && dev_count > 0) {
+        std::vector<VkPhysicalDevice> devs(dev_count);
+        if (vkEnumeratePhysicalDevices(inst, &dev_count, devs.data()) == VK_SUCCESS) {
+            VkPhysicalDevice phys = devs[std::min<uint32_t>(target_idx, dev_count - 1)];
+            VkPhysicalDeviceProperties props{};
+            vkGetPhysicalDeviceProperties(phys, &props);
+            out.device_name = props.deviceName;
+
+            uint32_t ext_cnt = 0;
+            if (vkEnumerateDeviceExtensionProperties(phys, nullptr, &ext_cnt, nullptr) == VK_SUCCESS) {
+                std::vector<VkExtensionProperties> exts(ext_cnt);
+                vkEnumerateDeviceExtensionProperties(phys, nullptr, &ext_cnt, exts.data());
+                out.probed = true;
+                out.has_av1 = false;
+                out.has_hevc = false;
+                out.has_h264 = false;
+                for (const auto &e : exts) {
+                    if (std::strcmp(e.extensionName, VK_KHR_VIDEO_ENCODE_AV1_EXTENSION_NAME) == 0) out.has_av1 = true;
+                    else if (std::strcmp(e.extensionName, VK_KHR_VIDEO_ENCODE_H265_EXTENSION_NAME) == 0) out.has_hevc = true;
+                    else if (std::strcmp(e.extensionName, VK_KHR_VIDEO_ENCODE_H264_EXTENSION_NAME) == 0) out.has_h264 = true;
+                }
+
+                auto pfn_get_caps = reinterpret_cast<PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR>(
+                    vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceVideoCapabilitiesKHR"));
+                if (pfn_get_caps && (out.has_av1 || out.has_hevc || out.has_h264)) {
+                    auto query_profile = [&](VkVideoComponentBitDepthFlagBitsKHR bd,
+                                             VkVideoCapabilitiesKHR &vcaps,
+                                             VkVideoEncodeCapabilitiesKHR &enc_c) -> bool {
+                        VkVideoProfileInfoKHR prof{};
+                        prof.sType = VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR;
+                        prof.chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR;
+                        prof.lumaBitDepth = bd;
+                        prof.chromaBitDepth = bd;
+
+                        VkVideoEncodeAV1ProfileInfoKHR av1_p{VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR, nullptr, STD_VIDEO_AV1_PROFILE_MAIN};
+                        VkVideoEncodeH265ProfileInfoKHR h265_p{VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_PROFILE_INFO_KHR, nullptr,
+                                                               (bd == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
+                                                                   ? STD_VIDEO_H265_PROFILE_IDC_MAIN_10
+                                                                   : STD_VIDEO_H265_PROFILE_IDC_MAIN};
+                        VkVideoEncodeH264ProfileInfoKHR h264_p{VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_PROFILE_INFO_KHR, nullptr, STD_VIDEO_H264_PROFILE_IDC_HIGH};
+
+                        VkVideoEncodeAV1CapabilitiesKHR av1_c{};
+                        av1_c.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_CAPABILITIES_KHR;
+                        VkVideoEncodeH265CapabilitiesKHR h265_c{};
+                        h265_c.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_CAPABILITIES_KHR;
+                        VkVideoEncodeH264CapabilitiesKHR h264_c{};
+                        h264_c.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_CAPABILITIES_KHR;
+
+                        enc_c = {};
+                        enc_c.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_CAPABILITIES_KHR;
+                        if (out.has_av1) {
+                            prof.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR;
+                            prof.pNext = &av1_p;
+                            enc_c.pNext = &av1_c;
+                        } else if (out.has_hevc) {
+                            prof.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR;
+                            prof.pNext = &h265_p;
+                            enc_c.pNext = &h265_c;
+                        } else {
+                            if (bd == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR) return false;
+                            prof.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR;
+                            prof.pNext = &h264_p;
+                            enc_c.pNext = &h264_c;
+                        }
+
+                        vcaps = {};
+                        vcaps.sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR;
+                        vcaps.pNext = &enc_c;
+                        return pfn_get_caps(phys, &prof, &vcaps) == VK_SUCCESS;
+                    };
+
+                    VkVideoCapabilitiesKHR vcaps8{};
+                    VkVideoEncodeCapabilitiesKHR enc_c8{};
+                    if (query_profile(VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR, vcaps8, enc_c8)) {
+                        if (enc_c8.maxQualityLevels > 0) {
+                            out.max_quality_levels = enc_c8.maxQualityLevels;
+                        }
+                        out.max_coded_width = vcaps8.maxCodedExtent.width;
+                        out.max_coded_height = vcaps8.maxCodedExtent.height;
+                        out.max_hw_bitrate = enc_c8.maxBitrate;
+                        if (enc_c8.rateControlModes != 0) {
+                            out.supports_vbr = (enc_c8.rateControlModes & VK_VIDEO_ENCODE_RATE_CONTROL_MODE_VBR_BIT_KHR) != 0;
+                            out.supports_cbr = (enc_c8.rateControlModes & VK_VIDEO_ENCODE_RATE_CONTROL_MODE_CBR_BIT_KHR) != 0;
+                            out.supports_cqp = (enc_c8.rateControlModes &
+                                (VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR |
+                                 VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DEFAULT_KHR)) != 0;
+                        }
+                    }
+
+                    // Probe actual 10-bit P010 hardware support rather than assuming it
+                    VkVideoCapabilitiesKHR vcaps10{};
+                    VkVideoEncodeCapabilitiesKHR enc_c10{};
+                    out.supports_10bit = query_profile(VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR, vcaps10, enc_c10);
+                }
+            }
+        }
+    }
+
+    vkDestroyInstance(inst, nullptr);
+    return out;
+}
+
 struct VulkanCompute::Impl {
     Config cfg;
     bool convert_gamut = false;

@@ -92,6 +92,72 @@ void test_cli_and_privileges() {
         check(cir3->display == "DP-2" && cir3->capture_mic && std::abs(cir3->mic_volume_pct - 180.0) < 1e-6,
               "base_defaults preserved");
         check(cir3->fps == 90 && cir3->duration_sec == 0.0, "explicit --fps overrides base_defaults and duration cleared");
+
+        // Verify hardware- and display-aware adaptive profile scaling
+        {
+            // Fractional & low refresh-rate handling (59.998Hz -> 60, 29.97Hz -> 30, 74.97Hz -> 75, 119.88Hz -> 120)
+            check(recommended_standard_fps(59.998) == 60, "59.998 Hz -> 60 fps");
+            check(recommended_standard_fps(59.94) == 60, "59.94 Hz -> 60 fps");
+            check(recommended_standard_fps(29.97) == 30, "29.97 Hz -> 30 fps");
+            check(recommended_standard_fps(30.0) == 30, "30 Hz -> 30 fps");
+            check(recommended_standard_fps(50.0) == 50, "50 Hz -> 50 fps");
+            check(recommended_gameplay_fps(59.998) == 60, "gameplay 59.998 Hz -> 60 fps");
+            check(recommended_gameplay_fps(74.97) == 75, "gameplay 74.97 Hz -> 75 fps");
+            check(recommended_gameplay_fps(89.9) == 90, "gameplay 89.9 Hz -> 90 fps");
+            check(recommended_gameplay_fps(119.88) == 120, "gameplay 119.88 Hz -> 120 fps");
+
+            // 720p @ 59.998Hz on a GPU without AV1 (HEVC + 10-bit supported)
+            ProfileTarget hevc_720p{};
+            hevc_720p.width = 1280; hevc_720p.height = 720; hevc_720p.refresh_hz = 59.998;
+            hevc_720p.has_av1 = false; hevc_720p.has_hevc = true; hevc_720p.has_h264 = true;
+            hevc_720p.supports_10bit = true;
+            Config c_def{}, c_gp{}, c_m{}, c_d{};
+            check(apply_profile(c_def, "default", hevc_720p).has_value(), "apply default hevc 720p");
+            check(c_def.codec == Codec::Hevc && c_def.fps == 60 &&
+                  c_def.bitrate <= 10'000'000 && c_def.bitrate >= 6'000'000,
+                  "720p non-AV1 selects HEVC @ 60fps with ~8M VBR");
+            check(apply_profile(c_gp, "gameplay", hevc_720p).has_value(), "apply gameplay hevc 720p");
+            check(c_gp.fps == 60 && c_gp.codec == Codec::Hevc, "59.998Hz display caps gameplay profile to 60 fps");
+            check(apply_profile(c_m, "master", hevc_720p).has_value(), "apply master hevc 720p");
+            check(c_m.codec == Codec::Hevc && c_m.pixfmt == PixelFormat::P010 && c_m.qp == 18,
+                  "HEVC master uses valid HEVC QP 18 + P010");
+            check(apply_profile(c_d, "desktop", hevc_720p).has_value(), "apply desktop hevc 720p");
+            check(c_d.codec == Codec::Hevc && c_d.qp == 26 && c_d.idr_interval == 240,
+                  "HEVC desktop uses valid HEVC QP 26 + 4s GOP");
+
+            // 1080p @ 30Hz TV panel: standard & gameplay both step down to 30 fps, 4s GOP = 120
+            ProfileTarget tv_30hz{};
+            tv_30hz.width = 1920; tv_30hz.height = 1080; tv_30hz.refresh_hz = 29.97;
+            Config c30_def{}, c30_comp{};
+            check(apply_profile(c30_def, "default", tv_30hz).has_value(), "apply default 30Hz");
+            check(c30_def.fps == 30 && c30_def.bitrate < 10'000'000, "30Hz monitor steps down to 30 fps & lower bitrate");
+            check(apply_profile(c30_comp, "compact", tv_30hz).has_value(), "apply compact 30Hz");
+            check(c30_comp.fps == 30 && c30_comp.idr_interval == 120, "30Hz 4s GOP scales to 120 frames");
+
+            // 4K @ 144Hz on AV1 GPU with max_hw_bitrate cap
+            ProfileTarget av1_4k{};
+            av1_4k.width = 3840; av1_4k.height = 2160; av1_4k.refresh_hz = 144.0;
+            av1_4k.max_hw_bitrate = 80'000'000;
+            Config c4k_def{}, c4k_gp{};
+            check(apply_profile(c4k_def, "default", av1_4k).has_value(), "apply default 4k");
+            check(c4k_def.codec == Codec::Av1 && c4k_def.bitrate >= 32'000'000 && c4k_def.bitrate <= 42'000'000,
+                  "4K AV1 default scales bitrate up (~37M)");
+            check(apply_profile(c4k_gp, "gameplay", av1_4k).has_value(), "apply gameplay 4k");
+            check(c4k_gp.fps == 120 && c4k_gp.max_bitrate == 80'000'000, "4K120 ceiling clamped to max_hw_bitrate");
+
+            // Driver that lacks VBR (CQP-only) and lacks 10-bit P010
+            ProfileTarget cqp_only{};
+            cqp_only.width = 1920; cqp_only.height = 1080; cqp_only.refresh_hz = 60.0;
+            cqp_only.has_av1 = false; cqp_only.has_hevc = true; cqp_only.has_h264 = true;
+            cqp_only.supports_10bit = false; cqp_only.supports_vbr = false; cqp_only.supports_cqp = true;
+            cqp_only.max_quality_levels = 1;
+            Config cc_def{}, cc_10{};
+            check(apply_profile(cc_def, "default", cqp_only).has_value(), "apply default cqp-only");
+            check(cc_def.rc == RateControl::Cqp && cc_def.qp == 22, "VBR-unsupported GPU falls back to CQP");
+            check(apply_profile(cc_10, "gameplay-10bit", cqp_only).has_value(), "apply 10bit on 8bit-only HEVC");
+            check(cc_10.pixfmt == PixelFormat::Nv12 && cc_10.dither && cc_10.quality == 0,
+                  "8-bit-only HEVC falls back to NV12+dither and clamps quality to 0");
+        }
     }
 
     auto disps = KmsCapture::enumerate_displays();
@@ -115,7 +181,7 @@ void test_cli_and_privileges() {
         check(c.has_value(), "profile + override parses");
         check(c->profile == "gameplay-10bit", "profile gameplay-10bit");
         check(c->pixfmt == PixelFormat::P010, "profile sets P010");
-        check(c->rc == RateControl::Vbr && c->bitrate == 35'000'000, "profile sets 35M VBR");
+        check(c->rc == RateControl::Vbr && c->bitrate == 40'000'000 && c->max_bitrate == 60'000'000, "profile sets 40M/60M VBR");
         check(c->fps == 240, "explicit -f 240 overrides profile 120 fps");
         check(c->output_path == "over.mkv", "explicit -o overrides default");
     }
@@ -191,12 +257,12 @@ void test_cli_and_privileges() {
         {
             Config ic3;
             // use_saved=n, mode=2(advanced), disp=1, codec=2(hevc), pixfmt=2(p010), fps=90, cursor=y, dur=10,
-            // rc=2(vbr), bitrate=30M, max_br=45M, quality=2, tune=1(hq), usage=1(record), content=2(desktop),
+            // rc=1(vbr), bitrate=30M, max_br=45M, quality=2, tune=1(hq), usage=1(record), content=2(desktop),
             // idr=180, async=4, b_depth=1, dev=0, qsz=6, gamut=3(srgb), cs=1(bt709), range=2(full),
             // sys_audio=y, sys_vol=125, mic=n, acodec=3(flac), res=native, out=adv.mkv, save=n
             std::istringstream in(
                 "n\n2\n1\n2\n2\n90\ny\n10\n"
-                "2\n30M\n45M\n2\n1\n1\n2\n"
+                "1\n30M\n45M\n2\n1\n1\n2\n"
                 "180\n4\n1\n0\n6\n3\n1\n2\n"
                 "y\n125\nn\n3\nnative\nadv.mkv\nn\n");
             std::ostringstream out;

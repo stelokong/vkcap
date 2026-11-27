@@ -5,6 +5,7 @@
 #include "pipeline.hpp"
 #include "privileges.hpp"
 #include "user_config.hpp"
+#include "vulkan_compute.hpp"
 
 #include <atomic>
 #include <csignal>
@@ -69,7 +70,32 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (cfg_res->list_profiles) {
-        vkcap::print_profiles();
+        vkcap::ProfileTarget target{};
+        std::string card_path;
+        if (auto disps = vkcap::KmsCapture::enumerate_displays(); disps && !disps->empty()) {
+            const auto &d = (*disps)[0];
+            target.width = d.width;
+            target.height = d.height;
+            target.refresh_hz = d.refresh_hz;
+            target.display_label = std::format("{} {}x{}@{:.0f}Hz", d.connector_name, d.width, d.height, d.refresh_hz);
+            card_path = d.card_path;
+        }
+        auto gpu = vkcap::probe_gpu_encode_support(cfg_res->device_index, cfg_res->device_explicit, card_path);
+        if (gpu.probed) {
+            target.has_av1 = gpu.has_av1;
+            target.has_hevc = gpu.has_hevc;
+            target.has_h264 = gpu.has_h264;
+            target.supports_10bit = gpu.supports_10bit;
+            target.supports_vbr = gpu.supports_vbr;
+            target.supports_cqp = gpu.supports_cqp;
+            target.supports_cbr = gpu.supports_cbr;
+            target.max_quality_levels = gpu.max_quality_levels;
+            target.max_coded_width = gpu.max_coded_width;
+            target.max_coded_height = gpu.max_coded_height;
+            target.max_hw_bitrate = gpu.max_hw_bitrate;
+            target.gpu_name = gpu.device_name;
+        }
+        vkcap::print_profiles(target);
         return 0;
     }
     if (cfg_res->list_mics) {

@@ -748,7 +748,9 @@ std::expected<std::unique_ptr<VideoEncoder>, std::string> VideoEncoder::open(
     AVDictionary *opts = nullptr;
     RateControl eff_rc = cfg.rc;
     if (eff_rc == RateControl::Auto) {
-        eff_rc = (cfg.bitrate > 0) ? RateControl::Vbr : RateControl::Cqp;
+        if (cfg.qp >= 0) eff_rc = RateControl::Cqp;
+        else if (cfg.bitrate > 0) eff_rc = RateControl::Vbr;
+        else eff_rc = RateControl::Cqp;
     }
 
     switch (eff_rc) {

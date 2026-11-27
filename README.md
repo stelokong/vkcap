@@ -88,20 +88,23 @@ Running `./build/vkcap` with **no arguments** in a terminal (or explicitly with 
    - **`[2] Advanced setup`**: Exposes every video, encoder, color management, audio, and container knob.
 3. Before recording begins, `vkcap` prints a **full summary** and the **exact equivalent CLI command** (including all non-default advanced flags) for scripting or repeat runs. Type `q` or press `Ctrl+D` at any prompt to cancel.
 
-### Premade Profiles (`-p, --profile <name>`)
-View all built-in profiles anytime with `./build/vkcap --list-profiles`. Explicit CLI flags always override profile values regardless of argument order:
+### Adaptive Profiles (`-p, --profile <name>`)
+Profiles are **hardware- and display-aware** rather than fixed constants. Run `./build/vkcap --list-profiles` to see the exact values tailored for your GPU and primary monitor:
 
-| Profile | Intended Use | Key Parameters |
+- **GPU capabilities (purely probed, zero vendor hardcoding)**: Queries Vulkan Video extensions (`AV1 → HEVC → H.264`), actual 10-bit `P010` hardware encode support, supported rate-control modes (`VBR` / `CQP` / `CBR` with automatic fallback if a driver lacks VBR), `maxQualityLevels`, and `maxBitrate` ceiling. Bitrates automatically adjust for codec efficiency (`AV1 1.0×`, `HEVC 1.20×`, `H.264 1.55×`), and CQP values map to each codec's native scale (`AV1 0..255` vs `HEVC/H.264 0..51`).
+- **Resolution & fractional refresh-rate awareness**: Scales VBR target/max bitrates smoothly with output resolution (`(pixels / 1440p)^0.75`) and FPS (`(fps / 60)^0.75`), normalizes fractional monitor rates (`59.94` / `59.998 Hz` → `60 fps`, `74.97 Hz` → `75 fps`, `119.88 Hz` → `120 fps`), steps standard profiles down on sub-60 Hz panels (e.g. `29.97`/`30 Hz` → `30 fps`, `50 Hz` → `50 fps`), and scales 4-second GOP lengths proportionally to the chosen FPS.
+
+Reference values at **1440p @ ≥120 Hz on an AV1 GPU** (explicit CLI flags always override):
+
+| Profile | Intended Use | Reference Parameters (1440p AV1) |
 | :--- | :--- | :--- |
-| `default` | Near-native quality, low overhead | 60 fps, AV1*, 8-bit NV12 + IGN dither, CQP 52, `quality=1`, `hq` |
-| `gameplay` | High-framerate 120 fps gameplay | 120 fps, AV1*, 8-bit NV12 + IGN dither, CQP 56, `quality=1`, `hq` |
-| `gameplay-10bit` | 120 fps 10-bit gameplay (zero banding) | 120 fps, AV1*, 10-bit P010, VBR 35M (max 52.5M), `quality=1`, `hq` |
-| `master` | Archival / editing master | 60 fps, AV1*, 10-bit P010, CQP 36, `quality=1`, `hq` |
-| `compact` | Small files for Discord / sharing / long sessions | 60 fps, AV1*, 8-bit NV12 + IGN dither, CQP 78, 4s GOP, `hq` |
-| `desktop` | Crisp UI, text, and tutorials at low bitrate | 60 fps, AV1*, 8-bit NV12 + IGN dither, CQP 62, 4s GOP, `content=desktop` |
-| `low-latency` | Minimum GPU/encoder footprint for max game FPS | 60 fps, AV1*, 8-bit NV12 + IGN dither, CQP 64, `quality=0`, `ll`, `async_depth=2` |
-
-*\*If your GPU does not support hardware AV1 encode and `--codec` was not explicitly passed, `vkcap` automatically falls back to `hevc` or `h264` and clamps `quality` to the driver's supported range.*
+| `default` | Near-native quality, bounded bitrate (recommended default) | 60 fps, AV1, 8-bit NV12 + IGN dither, **VBR 20M (max 32M)**, `quality=1`, `hq` |
+| `gameplay` | High-framerate gameplay | 120 fps, AV1, 8-bit NV12 + IGN dither, **VBR 35M (max 55M)**, `quality=1`, `hq` |
+| `gameplay-10bit` | 10-bit high-framerate gameplay (zero banding) | 120 fps, AV1, 10-bit P010, **VBR 40M (max 60M)**, `quality=1`, `hq` |
+| `master` | Archival / editing master (uncapped CQP) | 60 fps, AV1, 10-bit P010, **CQP 36** (`18` HEVC/H.264), `quality=1`, `hq` |
+| `compact` | Small files for Discord / sharing / long sessions | 60 fps, AV1, 8-bit NV12 + IGN dither, **VBR 8M (max 12M)**, 4s GOP, `hq` |
+| `desktop` | Crisp UI, text, and tutorials at low bitrate | 60 fps, AV1, 8-bit NV12 + IGN dither, **CQP 62** (`26` HEVC/H.264), 4s GOP, `content=desktop` |
+| `low-latency` | Minimum GPU/encoder footprint for max game FPS | 60 fps, AV1, 8-bit NV12 + IGN dither, **VBR 18M (max 28M)**, `quality=0`, `ll`, `async_depth=2` |
 
 ### Common CLI Examples
 ```bash
@@ -177,10 +180,10 @@ While recording, `vkcap` prints a live single-line status bar with elapsed time,
 | `--audio-bitrate <rate>` | `192k` | Audio bitrate for `opus` / `aac` (48 kHz stereo) |
 | `--codec <name>` | `av1` (auto-fallback) | Video codec: `av1`, `hevc`, `h264` |
 | `--pixfmt <fmt>` | `nv12` | Surface format: `nv12` (8-bit + IGN dither) or `p010` (10-bit) |
-| `--rc <mode>` | `auto` | Rate control: `auto`, `cqp`, `cbr`, `vbr` |
-| `--qp <n>` | `52` (AV1) / `22` | CQP quantizer (`0..255` for AV1, `0..51` for HEVC/H.264) |
-| `-b, --bitrate <rate>` | — | Target bitrate (e.g. `20M`, `35M`); selects VBR when `--rc=auto` |
-| `--max-bitrate <rate>` | `1.5× bitrate` | Max bitrate for VBR mode |
+| `--rc <mode>` | `auto` (VBR 20M/32M) | Rate control: `auto`, `vbr`, `cqp`, `cbr` |
+| `--qp <n>` | `52` (AV1) / `22` | CQP quantizer (`0..255` for AV1, `0..51` for HEVC/H.264); selects CQP when `--rc=auto` |
+| `-b, --bitrate <rate>` | `20M` | Target bitrate (e.g. `20M`, `35M`); selects VBR when `--rc=auto` |
+| `--max-bitrate <rate>` | `32M` / `1.5× bitrate` | Max bitrate ceiling for VBR mode |
 | `--quality <0..16>` | auto (`1`, clamped) | Encoder quality level (clamped to the GPU's `maxQualityLevels`) |
 | `--tune <mode>` | `hq` | `default`, `hq`, `ll`, `ull`, `lossless` |
 | `--usage <mode>` | `record` | `default`, `transcode`, `stream`, `record`, `conference` |
