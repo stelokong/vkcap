@@ -63,6 +63,35 @@ void test_cli_and_privileges() {
                   "expand_user_path ~/");
         }
         check(expand_user_path("relative.mkv") == "relative.mkv", "expand_user_path relative unchanged");
+
+        auto cr = parse_crop("1920x1080+320+180");
+        check(cr.has_value() && cr->width == 1920 && cr->height == 1080 && cr->x == 320 && cr->y == 180,
+              "parse_crop valid");
+        check(!parse_crop("1920x1080").has_value(), "reject crop without +X+Y");
+        check(!parse_crop("0x1080+0+0").has_value(), "reject zero-width crop");
+
+        const char *argv_ir[] = {"vkcap", "--instant-replay", "--crop", "1280x720+100+50", "-o", "rep.mkv"};
+        auto cir = parse_args(static_cast<int>(std::size(argv_ir)), const_cast<char **>(argv_ir));
+        check(cir.has_value() && cir->replay_seconds == 30, "--instant-replay defaults to 30s");
+        check(cir->crop.valid() && cir->crop.width == 1280 && cir->crop.x == 100, "--crop parsed");
+
+        const char *argv_ir2[] = {"vkcap", "--instant-replay", "60", "-o", "rep.mkv"};
+        auto cir2 = parse_args(static_cast<int>(std::size(argv_ir2)), const_cast<char **>(argv_ir2));
+        check(cir2.has_value() && cir2->replay_seconds == 60, "--instant-replay 60");
+
+        // Verify base_defaults seeding + explicit CLI override
+        Config base_def;
+        base_def.fps = 120;
+        base_def.display = "DP-2";
+        base_def.capture_mic = true;
+        base_def.mic_volume_pct = 180.0;
+        base_def.duration_sec = 45.0;  // Should be cleared when seeding replay defaults
+        const char *argv_ir3[] = {"vkcap", "--instant-replay", "--fps", "90"};
+        auto cir3 = parse_args(static_cast<int>(std::size(argv_ir3)), const_cast<char **>(argv_ir3), &base_def);
+        check(cir3.has_value() && cir3->replay_seconds == 30, "base_defaults + --instant-replay");
+        check(cir3->display == "DP-2" && cir3->capture_mic && std::abs(cir3->mic_volume_pct - 180.0) < 1e-6,
+              "base_defaults preserved");
+        check(cir3->fps == 90 && cir3->duration_sec == 0.0, "explicit --fps overrides base_defaults and duration cleared");
     }
 
     auto disps = KmsCapture::enumerate_displays();
@@ -411,6 +440,84 @@ void test_kms_gpu_pipeline(PixelFormat pixfmt,
         num_frames, sec, fps, comp_ms);
 }
 
+void test_instant_replay_and_crop() {
+    const std::string out_path = "/tmp/vkcap_test_replay_crop.mkv";
+    std::filesystem::remove(out_path);
+
+    Config cfg;
+    cfg.output_path = out_path;
+    cfg.fps = 60;
+    cfg.idr_interval = 30;  // 0.5s GOP for crisp 2s replay test
+    cfg.replay_seconds = 2;
+    cfg.pixfmt = PixelFormat::Nv12;
+    cfg.capture_cursor = false;
+
+    auto vk = *VulkanCompute::create(cfg);
+    check(vk->configure_output(1280, 720).has_value(), "replay configure_output 1280x720");
+    auto enc = *VideoEncoder::open(cfg, 1280, 720, vk->hw_device_ref(), vk->hw_frames_ref(), true);
+    check(enc->replay_mode(), "encoder in replay mode");
+    check(!std::filesystem::exists(out_path), "replay mode creates no file before save trigger");
+
+    constexpr uint32_t kPool = 3;
+    std::vector<VulkanCompute::TestDmaBuf> bufs;
+    for (uint32_t i = 0; i < kPool; ++i) {
+        bufs.push_back(*vk->create_test_dmabuf(1920, 1080, i, false));
+    }
+
+    // Feed 210 frames (3.5s) + matching Opus audio into a 2s rolling buffer
+    const int afsz = enc->audio_frame_size();
+    std::vector<float> tone(static_cast<size_t>(afsz) * 2, 0.05f);
+    int a_idx = 0;
+    for (uint32_t i = 0; i < 210; ++i) {
+        KmsFrame kf{};
+        auto &db = bufs[i % kPool];
+        kf.primary.inode_key = db.inode_key;
+        kf.primary.drm_fourcc = DRM_FORMAT_ARGB8888;
+        kf.primary.width = 1920;
+        kf.primary.height = 1080;
+        kf.primary.drm_modifier = db.modifier;
+        kf.primary.has_modifier = true;
+        kf.primary.num_planes = 1;
+        kf.primary.planes[0].fd = ::dup(db.fd);
+        kf.primary.planes[0].stride = db.stride;
+        kf.primary.planes[0].size = db.stride * 1080;
+        kf.crop = {320, 180, 1280, 720};
+
+        auto fres = vk->process_frame(kf);
+        check(fres.has_value(), "replay crop process_frame");
+        AVFrame *avf = *fres;
+        check(enc->encode_frame(avf, static_cast<int64_t>(i)).has_value(), "replay encode_frame");
+        av_frame_free(&avf);
+
+        // Emit ~50 audio frames/sec (every 1.2 video frames)
+        if ((i % 6) != 5) {
+            check(enc->encode_audio_samples(tone.data(), afsz, static_cast<int64_t>(a_idx) * afsz).has_value(),
+                  "replay encode_audio_samples");
+            ++a_idx;
+        }
+    }
+
+    auto rstats = enc->replay_stats();
+    check(rstats.buffered_bytes > 0 && rstats.buffered_sec >= 1.8, "replay buffer populated & bounded");
+
+    const auto snap_t0 = std::chrono::steady_clock::now();
+    auto saved = enc->save_replay_async(out_path);
+    const double snap_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - snap_t0).count();
+    check(saved.has_value() && *saved == out_path, "save_replay_async queued");
+
+    check(enc->finish().has_value(), "replay encoder finish (waits for background save)");
+    for (auto &db : bufs) vk->destroy_test_dmabuf(db);
+
+    check(std::filesystem::exists(out_path), "replay file written to disk");
+    verify_av1_container(out_path, 1280, 720, 115, true);
+    std::filesystem::remove(out_path);
+
+    std::cout << std::format(
+        "[PASS] instant_replay_crop (1920x1080 -> crop 1280x720, 2s ring): snapshot {:.3f} ms, buffered {:.1f}s ({:.2f} MiB)\n",
+        snap_ms, rstats.buffered_sec, static_cast<double>(rstats.buffered_bytes) / (1024.0 * 1024.0));
+}
+
 }  // namespace
 
 int main() {
@@ -419,6 +526,7 @@ int main() {
     test_kms_gpu_pipeline(PixelFormat::P010, 1920, 1080, 1920, 1080, 60, "mkv", true, false, true);
     test_kms_gpu_pipeline(PixelFormat::Nv12, 3840, 2160, 2560, 1440, 60, "webm", true);
     test_kms_gpu_pipeline(PixelFormat::Nv12, 3840, 2160, 3840, 2160, 180, "mkv", false);
+    test_instant_replay_and_crop();
     std::cout << "All KMS unit and GPU integration tests passed.\n";
     return 0;
 }

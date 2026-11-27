@@ -124,6 +124,19 @@ View all built-in profiles anytime with `./build/vkcap --list-profiles`. Explici
 # Downscale 4K display to 1440p using resolution shorthand + lossless FLAC audio
 ./build/vkcap -D DP-1 -s 1440p --audio-codec flac -o ~/Videos/scaled.mkv
 
+# Zero-copy GPU crop region (WxH+X+Y)
+./build/vkcap -D DP-1 --crop 1920x1080+320+180 -o ~/Videos/cropped.mkv
+
+# Instant Replay: inherits your ~/.config/vkcap/defaults.conf (display, FPS, audio, output dir)
+# Keep the last 30s (or 60s) in RAM; save via 's'/Enter or `pkill -USR2 vkcap`
+./build/vkcap --instant-replay
+./build/vkcap --instant-replay 60 -p gameplay -o ~/Videos/replays/clip.mp4
+
+# Keybind controls while running:
+#   pkill -USR1 vkcap   -> Pause / Resume recording (continuous A/V timestamps)
+#   pkill -USR2 vkcap   -> Save Instant Replay clip (zero-stutter background write)
+#   pkill -INT  vkcap   -> Stop & finalize cleanly (second Ctrl+C force-exits)
+
 # Video-only 10-bit master recording without hardware cursor
 ./build/vkcap -D DP-1 -p master --no-sound --no-cursor -o ~/Videos/archive.mkv
 
@@ -150,7 +163,9 @@ While recording, `vkcap` prints a live single-line status bar with elapsed time,
 | `-o, --output <path>` | `vkcap_<ts>.mkv` | Output file (`.mkv`, `.mp4`, `.webm`, `.ivf`); expands `~/` and creates parent dirs |
 | `-f, --fps <n>` | `60` | Locked CFR capture framerate (`1..1000`) |
 | `-s, --scale <WxH\|preset>` | native | GPU Catmull-Rom bicubic scaling (even `WxH`, or `720p`, `1080p`, `1440p`, `4k`) |
+| `--crop <WxH+X+Y>` | full display | Zero-copy GPU crop region in display pixels (e.g. `1920x1080+320+180`) |
 | `-d, --duration <sec>` | unlimited | Stop recording automatically after `<sec>` seconds |
+| `--instant-replay [sec]` | off (`30` if flag set) | Rolling instant-replay buffer (`5..600`s) in RAM (inherits `~/.config/vkcap/defaults.conf`); save via `'s'`/`Enter` or `SIGUSR2` |
 | `--no-cursor` | off | Disable GPU compositing of the hardware KMS cursor plane |
 | `--no-sound`, `--no-audio` | audio ON | Disable all audio recording (video-only) |
 | `--no-system-audio` | system ON | Disable desktop/application audio (e.g. for mic-only) |
@@ -188,11 +203,11 @@ While recording, `vkcap` prints a live single-line status bar with elapsed time,
 
 `vkcap` intentionally focuses on a single, rock-solid, zero-copy recording path. The following features are **not currently supported**:
 
-- **Window or arbitrary region capture**: Captures the full DRM/KMS primary scanout plane of the selected display (plus its hardware cursor plane).
+- **Window-specific capture**: Captures the DRM/KMS primary scanout plane (full display or fixed `--crop WxH+X+Y` region) rather than tracking a moving window.
 - **Multi-monitor stitched capture**: Each `vkcap` instance records one selected display.
 - **Per-application audio capture / separate audio tracks**: Captures all desktop audio via the PipeWire sink monitor and mixes it with the optional microphone into a single stereo track.
-- **Live network streaming (RTMP / SRT / WHIP)**: Local file recording only (`.mkv`, `.mp4`, `.webm`, `.ivf`).
-- **Replay buffer / retroactive clip saving**: Continuous start/stop recording only.
+- **Live network streaming (RTMP / SRT / WHIP)**: Local file recording and instant replay only (`.mkv`, `.mp4`, `.webm`, `.ivf`).
+- **Portrait / rotated display un-rotation**: Captures scanout planes in native orientation (`rotation` plane property is not yet applied).
 - **HDR10 PQ / HLG tone-mapping or HDR static metadata passthrough**: Color management targets SDR output (`BT.709` or `BT.2020`), including automatic EDID wide-gamut inversion for SDR content on wide-gamut Wayland displays.
 - **CPU software video encoding fallback**: Requires a GPU with Vulkan Video encode support (`AV1`, `HEVC`, or `H.264`).
 - **Legacy PulseAudio/ALSA-only audio capture**: Audio capture uses native PipeWire (`libpipewire-0.3`). Video-only recording (`--no-sound`) works without PipeWire running.

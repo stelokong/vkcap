@@ -78,10 +78,11 @@ Hardware cursor compositing, EDID wide-gamut color inversion, bicubic scaling, a
 - **Zero-allocation DRM/KMS hot path**: `grab_frame()` uses direct stack-allocated kernel ioctls (`DRM_IOCTL_MODE_GETPLANE`, 64-entry `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` with dynamic fallback only if >64 properties, `DRM_IOCTL_MODE_GETFB2`, `DRM_IOCTL_PRIME_HANDLE_TO_FD`, `DRM_IOCTL_GEM_CLOSE`) inside a **single `ScopedCapSysAdmin` window** per frame (2 `SYS_capset` syscalls/frame total).
 - **Single-GPU zero-overhead device selection**: On multi-GPU systems, `VK_EXT_physical_device_drm` automatically matches the Vulkan physical device to the selected `/dev/dri/card*` node; on single-GPU systems, `/dev/dri` inspection short-circuits immediately without creating a temporary `VkInstance` or loading implicit Vulkan layers twice.
 - **Multi-plane / disjoint DMA-BUF import**: Single-BO buffers take a zero-overhead single-allocation path; multi-BO compressed modifiers (such as Intel CCS) automatically use `VK_IMAGE_CREATE_DISJOINT_BIT` and `VkBindImagePlaneMemoryInfo`.
-- **Flat L1-resident MRU caches**: Both the 12-entry `st_ino` DMA-BUF import cache (`src_cache`) and `AVVkFrame` alias cache (`dst_alias_cache`) are flat contiguous arrays on the single capture thread—no mutexes, no hash maps. Triple-buffered scanout hits indices `0..2` in L1 cache.
+- **Flat L1-resident MRU caches with stale BO eviction**: Both the 6-entry `st_ino` DMA-BUF import cache (`src_cache`) and `AVVkFrame` alias cache (`dst_alias_cache`) are flat contiguous arrays on the single capture thread—no mutexes, no hash maps. Triple-buffered scanout hits indices `0..2` in L1 cache, while automatic stale-surface eviction (releasing scanout DMA-BUFs unused for >180 frames) and a compact `AVHWFramesContext` pool (`queue_size + async_depth + 4`) ensure destroyed desktop/game swapchain BOs are never left pinned in VRAM across fullscreen launches.
 - **LIFO `AVBufferPool` probing**: Probes FFmpeg's LIFO hardware frame pool via `vkGetSemaphoreCounterValue()` using reusable empty `AVFrame` shells (`probe_shells`) to grab an idle `AVVkFrame` immediately without stalling on in-flight hardware encodes.
 - **Coalesced muxer locking & recycled `AVPacket` pool**: `vkcap-enc`, `vkcap-aenc`, and `vkcap-mux` share a fixed 256-entry packet ring and a 32-entry recycled `AVPacket` pool. Packet recycling and ring push/pop are coalesced under a single `pkt_mtx` acquisition per packet, halving mutex operations across all three threads.
-- **Precision CFR pacing**: `CLOCK_MONOTONIC` `clock_nanosleep(TIMER_ABSTIME)` with `PR_SET_TIMERSLACK(1)` and a single monotonic clock read per frame eliminates variable frame-time jitter.
+- **Zero-stutter, zero-VRAM Instant Replay (`--instant-replay`)**: Copies only the compressed hardware-encoded video bytes (`p->size`, ~2–50 KiB/frame) into plain CPU `AVPacket`s and immediately calls `av_packet_unref()` on the encoder packet so `av1_vulkan`'s multi-megabyte Vulkan `VkDeviceMemory` bitstream buffers are returned to FFmpeg's pool immediately (**0 GPU BOs / 0 VRAM / 0 GTT** held by the replay ring, **0 disk I/O** while buffering; audio packets are pushed zero-copy). On save (`SIGUSR2` or `'s'`/`Enter`), takes an `O(1)` shallow `av_packet_ref()` snapshot (**~0.06 ms**, zero bitstream memcpy) and muxes the pre-encoded packets straight to disk on a low-priority (`nice(10)`) `vkcap-save` thread with zero re-encoding and zero impact on live capture or game FPS.
+- **Precision CFR pacing**: `CLOCK_MONOTONIC` `clock_nanosleep(TIMER_ABSTIME)` with `PR_SET_TIMERSLACK(1)` and a single monotonic clock read per frame eliminates variable frame-time jitter (with `SIGUSR1` pause/resume shifting `pause_offset_ns` atomically across both video and audio threads for continuous A/V timestamps).
 
 ---
 
@@ -100,7 +101,8 @@ Measured via `ctest --test-dir build --output-on-failure --verbose` on **AMD Rad
 
 | Workload | End-to-End Throughput | Compute Wall Time (Submit + Fence) |
 | :--- | :---: | :---: |
-| 1080p NV12 + HW Cursor + Wide-Gamut → MP4 (AV1 + Opus) | **394.1 fps** | **0.140 ms / frame** |
-| 1080p P010 (10-bit) + HW Cursor → MKV (AV1 + Opus) | **348.7 fps** | **0.093 ms / frame** |
-| 4K → 1440p Catmull-Rom Bicubic + HW Cursor → WebM (AV1) | **227.6 fps** | **0.228 ms / frame** |
-| 4K Native NV12 → MKV (AV1) | **105.9 fps** | **0.155 ms / frame** |
+| 1080p NV12 + HW Cursor + Wide-Gamut → MP4 (AV1 + Opus) | **394.0 fps** | **0.142 ms / frame** |
+| 1080p P010 (10-bit) + HW Cursor → MKV (AV1 + Opus) | **348.1 fps** | **0.094 ms / frame** |
+| 4K → 1440p Catmull-Rom Bicubic + HW Cursor → WebM (AV1) | **226.8 fps** | **0.231 ms / frame** |
+| 4K Native NV12 → MKV (AV1) | **105.8 fps** | **0.149 ms / frame** |
+| Instant Replay + GPU Crop (1080p → 720p, 2s ring + Opus) | **0.062 ms snapshot** | Zero-stutter async mux, full decode verified |

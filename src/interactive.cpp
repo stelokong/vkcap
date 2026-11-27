@@ -370,8 +370,12 @@ std::string format_equiv_cli(const Config &cfg, const char *prog_name) {
             cmd += std::format(" --audio-bitrate {}k", cfg.audio_bitrate / 1000);
         }
     }
+    if (cfg.crop.valid()) {
+        cmd += std::format(" --crop {}x{}+{}+{}", cfg.crop.width, cfg.crop.height, cfg.crop.x, cfg.crop.y);
+    }
     if (cfg.out_width > 0 && cfg.out_height > 0) cmd += std::format(" -s {}x{}", cfg.out_width, cfg.out_height);
     if (!cfg.capture_cursor) cmd += " --no-cursor";
+    if (cfg.replay_seconds > 0) cmd += std::format(" --instant-replay {}", cfg.replay_seconds);
     if (cfg.duration_sec > 0.0) cmd += std::format(" -d {}", cfg.duration_sec);
     cmd += std::format(" -o {}", cfg.output_path);
     return cmd;

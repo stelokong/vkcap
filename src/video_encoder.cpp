@@ -4,12 +4,15 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <ctime>
+#include <deque>
 #include <filesystem>
 #include <format>
 #include <iostream>
 #include <mutex>
 #include <pthread.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 #include <vulkan/vulkan.h>
 
@@ -176,11 +179,266 @@ struct VideoEncoder::Impl {
     std::mutex audio_enc_mtx;
     bool header_written = false;
     bool finished = false;
+    bool is_replay = false;
+    bool encode_failed = false;
     int64_t last_pts = -1;
 
     std::atomic<uint64_t> frames_submitted{0};
     std::atomic<uint64_t> packets_written{0};
     std::atomic<uint64_t> bytes_written{0};
+
+    // Instant replay rolling encoded-bitstream ring (0 extra VRAM, 0 disk I/O while buffering)
+    std::mutex replay_mtx;
+    std::deque<AVPacket *> replay_v_pkts;
+    std::deque<AVPacket *> replay_a_pkts;
+    uint64_t replay_bytes = 0;
+    std::atomic<uint64_t> replay_clips_saved{0};
+    uint32_t replay_save_seq = 0;
+
+    struct SaveJob {
+        std::string out_path;
+        AVCodecParameters *v_par = nullptr;
+        AVRational v_tb{1, 60};
+        AVRational v_fps{60, 1};
+        AVCodecParameters *a_par = nullptr;
+        AVRational a_tb{1, 48000};
+        std::vector<AVPacket *> v_pkts;
+        std::vector<AVPacket *> a_pkts;
+        double duration_sec = 0.0;
+    };
+    std::mutex save_mtx;
+    std::condition_variable save_cv;
+    std::deque<SaveJob> save_queue;
+    bool saver_stop = false;
+    std::jthread saver_thread;
+
+    static void free_save_job(SaveJob &job) noexcept {
+        for (AVPacket *p : job.v_pkts) av_packet_free(&p);
+        for (AVPacket *p : job.a_pkts) av_packet_free(&p);
+        job.v_pkts.clear();
+        job.a_pkts.clear();
+        if (job.v_par) avcodec_parameters_free(&job.v_par);
+        if (job.a_par) avcodec_parameters_free(&job.a_par);
+    }
+
+    static std::expected<uint64_t, std::string> write_replay_job(SaveJob &job) {
+        std::filesystem::path out_p(job.out_path);
+        if (out_p.has_parent_path()) {
+            std::error_code ec;
+            std::filesystem::create_directories(out_p.parent_path(), ec);
+            if (ec) {
+                return std::unexpected(std::format("Failed to create directory '{}': {}",
+                                                   out_p.parent_path().string(), ec.message()));
+            }
+        }
+
+        AVFormatContext *ofmt = nullptr;
+        int err = avformat_alloc_output_context2(&ofmt, nullptr, nullptr, job.out_path.c_str());
+        if (err < 0 || !ofmt) {
+            return std::unexpected(std::format("Could not determine output format for '{}': {}",
+                                               job.out_path, ff_err(err)));
+        }
+
+        auto cleanup = [&]() {
+            if (ofmt) {
+                if (!(ofmt->oformat->flags & AVFMT_NOFILE) && ofmt->pb) {
+                    avio_closep(&ofmt->pb);
+                }
+                avformat_free_context(ofmt);
+                ofmt = nullptr;
+            }
+        };
+
+        AVStream *vst = avformat_new_stream(ofmt, nullptr);
+        if (!vst || avcodec_parameters_copy(vst->codecpar, job.v_par) < 0) {
+            cleanup();
+            return std::unexpected("Failed to initialize replay video stream");
+        }
+        vst->codecpar->codec_tag = 0;
+        vst->time_base = job.v_tb;
+        vst->avg_frame_rate = job.v_fps;
+        vst->r_frame_rate = job.v_fps;
+
+        AVStream *ast = nullptr;
+        const bool is_ivf = ofmt->oformat->name && std::strcmp(ofmt->oformat->name, "ivf") == 0;
+        if (job.a_par && !is_ivf) {
+            ast = avformat_new_stream(ofmt, nullptr);
+            if (!ast || avcodec_parameters_copy(ast->codecpar, job.a_par) < 0) {
+                cleanup();
+                return std::unexpected("Failed to initialize replay audio stream");
+            }
+            ast->codecpar->codec_tag = 0;
+            ast->time_base = job.a_tb;
+        }
+
+        if (!(ofmt->oformat->flags & AVFMT_NOFILE)) {
+            err = avio_open(&ofmt->pb, job.out_path.c_str(), AVIO_FLAG_WRITE);
+            if (err < 0) {
+                cleanup();
+                return std::unexpected(std::format("avio_open('{}') failed: {}", job.out_path, ff_err(err)));
+            }
+        }
+
+        AVDictionary *mux_opts = nullptr;
+        if (ofmt->oformat->name && std::strstr(ofmt->oformat->name, "mp4") != nullptr) {
+            av_dict_set(&mux_opts, "movflags", "+faststart", 0);
+        }
+        err = avformat_write_header(ofmt, &mux_opts);
+        av_dict_free(&mux_opts);
+        if (err < 0) {
+            cleanup();
+            return std::unexpected(std::format("avformat_write_header(replay) failed: {}", ff_err(err)));
+        }
+
+        uint64_t total_bytes = 0;
+        size_t vi = 0, ai = 0;
+        while (vi < job.v_pkts.size() || (ast && ai < job.a_pkts.size())) {
+            bool pick_video = false;
+            if (vi < job.v_pkts.size() && (!ast || ai >= job.a_pkts.size())) {
+                pick_video = true;
+            } else if (vi < job.v_pkts.size() && ast && ai < job.a_pkts.size()) {
+                pick_video = (av_compare_ts(job.v_pkts[vi]->dts, job.v_tb,
+                                            job.a_pkts[ai]->dts, job.a_tb) <= 0);
+            }
+            if (pick_video) {
+                AVPacket *p = job.v_pkts[vi++];
+                p->stream_index = vst->index;
+                total_bytes += static_cast<uint64_t>(p->size);
+                av_packet_rescale_ts(p, job.v_tb, vst->time_base);
+                err = av_interleaved_write_frame(ofmt, p);
+            } else {
+                AVPacket *p = job.a_pkts[ai++];
+                p->stream_index = ast->index;
+                total_bytes += static_cast<uint64_t>(p->size);
+                av_packet_rescale_ts(p, job.a_tb, ast->time_base);
+                err = av_interleaved_write_frame(ofmt, p);
+            }
+            if (err < 0) {
+                cleanup();
+                return std::unexpected(std::format("av_interleaved_write_frame(replay) failed: {}", ff_err(err)));
+            }
+        }
+
+        err = av_write_trailer(ofmt);
+        cleanup();
+        if (err < 0) {
+            return std::unexpected(std::format("av_write_trailer(replay) failed: {}", ff_err(err)));
+        }
+        return total_bytes;
+    }
+
+    void start_saver() {
+        saver_thread = std::jthread([this](std::stop_token) {
+            pthread_setname_np(pthread_self(), "vkcap-save");
+            // Lower scheduling priority so background replay writes never compete with games or capture
+            (void)::nice(10);
+            while (true) {
+                SaveJob job{};
+                {
+                    std::unique_lock lk(save_mtx);
+                    save_cv.wait(lk, [this] { return saver_stop || !save_queue.empty(); });
+                    if (save_queue.empty()) {
+                        if (saver_stop) break;
+                        continue;
+                    }
+                    job = std::move(save_queue.front());
+                    save_queue.pop_front();
+                }
+
+                auto res = write_replay_job(job);
+                const std::string saved_path = job.out_path;
+                const double dur = job.duration_sec;
+                free_save_job(job);
+
+                if (res) {
+                    replay_clips_saved.fetch_add(1, std::memory_order_relaxed);
+                    std::cerr << std::format(
+                        "\n[vkcap] Saved replay '{}' ({:.1f}s, {:.2f} MiB)\n",
+                        saved_path, dur, static_cast<double>(*res) / (1024.0 * 1024.0))
+                              << std::flush;
+                } else {
+                    std::cerr << std::format("\n[vkcap] Replay save failed: {}\n", res.error())
+                              << std::flush;
+                }
+            }
+        });
+    }
+
+    void stop_saver() {
+        {
+            std::lock_guard lk(save_mtx);
+            saver_stop = true;
+        }
+        save_cv.notify_all();
+        if (saver_thread.joinable()) {
+            saver_thread.join();
+        }
+        for (auto &j : save_queue) free_save_job(j);
+        save_queue.clear();
+    }
+
+    void clear_replay_buffers() {
+        std::lock_guard lk(replay_mtx);
+        for (AVPacket *p : replay_v_pkts) av_packet_free(&p);
+        for (AVPacket *p : replay_a_pkts) av_packet_free(&p);
+        replay_v_pkts.clear();
+        replay_a_pkts.clear();
+        replay_bytes = 0;
+    }
+
+    void push_replay_packet_locked(AVPacket *p, bool is_video) {
+        if (is_video) {
+            replay_v_pkts.push_back(p);
+            replay_bytes += static_cast<uint64_t>(p->size);
+            const int64_t window_ticks = static_cast<int64_t>(cfg.replay_seconds) *
+                                         static_cast<int64_t>(std::max<uint32_t>(1u, cfg.fps));
+            const int64_t newest = p->pts;
+            const int64_t cutoff = newest - window_ticks;
+            // Find the latest keyframe at or before cutoff so the buffer always starts on a keyframe
+            // covering at least replay_seconds.
+            size_t drop_until = 0;
+            for (size_t i = 1; i < replay_v_pkts.size(); ++i) {
+                if ((replay_v_pkts[i]->flags & AV_PKT_FLAG_KEY) != 0 &&
+                    replay_v_pkts[i]->pts <= cutoff) {
+                    drop_until = i;
+                }
+            }
+            for (size_t i = 0; i < drop_until; ++i) {
+                AVPacket *old = replay_v_pkts.front();
+                replay_v_pkts.pop_front();
+                replay_bytes -= std::min<uint64_t>(replay_bytes, static_cast<uint64_t>(old->size));
+                av_packet_unref(old);
+                if (free_pkts.size() < 32) free_pkts.push_back(old);
+                else av_packet_free(&old);
+            }
+            if (audio_enc_ctx && !replay_v_pkts.empty()) {
+                const int64_t a_keep = av_rescale_q(replay_v_pkts.front()->pts,
+                                                    enc_ctx->time_base, audio_enc_ctx->time_base) - 24000;
+                while (!replay_a_pkts.empty() && replay_a_pkts.front()->pts < a_keep) {
+                    AVPacket *old = replay_a_pkts.front();
+                    replay_a_pkts.pop_front();
+                    replay_bytes -= std::min<uint64_t>(replay_bytes, static_cast<uint64_t>(old->size));
+                    av_packet_unref(old);
+                    if (free_pkts.size() < 32) free_pkts.push_back(old);
+                    else av_packet_free(&old);
+                }
+            }
+        } else {
+            replay_a_pkts.push_back(p);
+            replay_bytes += static_cast<uint64_t>(p->size);
+            // Cap audio buffer if video hasn't started yet
+            const int64_t max_a_span = static_cast<int64_t>(cfg.replay_seconds + 5) * 48000LL;
+            while (replay_a_pkts.size() > 1 &&
+                   (replay_a_pkts.back()->pts - replay_a_pkts.front()->pts) > max_a_span) {
+                AVPacket *old = replay_a_pkts.front();
+                replay_a_pkts.pop_front();
+                replay_bytes -= std::min<uint64_t>(replay_bytes, static_cast<uint64_t>(old->size));
+                av_packet_unref(old);
+                if (free_pkts.size() < 32) free_pkts.push_back(old);
+                else av_packet_free(&old);
+            }
+        }
+    }
 
     static constexpr size_t kMaxQueuedPackets = 256;
     AVPacket *scratch_pkt = nullptr;
@@ -269,10 +527,11 @@ struct VideoEncoder::Impl {
     }
 
     std::expected<void, std::string> drain_packets_from(AVCodecContext *ctx, AVStream *st, AVPacket *&scratch) {
+        const bool is_video = (ctx == enc_ctx);
         while (true) {
             if (!scratch) {
                 {
-                    std::lock_guard lk(pkt_mtx);
+                    std::lock_guard lk(is_replay ? replay_mtx : pkt_mtx);
                     if (!free_pkts.empty()) {
                         scratch = free_pkts.back();
                         free_pkts.pop_back();
@@ -285,21 +544,70 @@ struct VideoEncoder::Impl {
             }
             int r = avcodec_receive_packet(ctx, scratch);
             if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) {
-                if (has_writer_err.load(std::memory_order_acquire)) {
+                if (!is_replay && has_writer_err.load(std::memory_order_acquire)) {
                     std::lock_guard lk(pkt_mtx);
                     return std::unexpected(writer_err);
                 }
                 return {};
             }
             if (r < 0) {
+                if (is_video) encode_failed = true;
                 return std::unexpected(std::format("avcodec_receive_packet failed: {}", ff_err(r)));
             }
             AVPacket *p = scratch;
             scratch = nullptr;
-            p->stream_index = st->index;
-            av_packet_rescale_ts(p, ctx->time_base, st->time_base);
             packets_written.fetch_add(1, std::memory_order_relaxed);
             bytes_written.fetch_add(static_cast<uint64_t>(p->size), std::memory_order_relaxed);
+
+            if (is_replay) {
+                if (is_video) {
+                    // Copy only the compressed p->size bytes into a plain CPU-backed AVPacket and
+                    // immediately unref `p` so any Vulkan VkDeviceMemory bitstream buffer owned by
+                    // av1_vulkan is returned to FFmpeg's pool right away (0 VRAM/GTT held by replay ring).
+                    AVPacket *cpu_pkt = nullptr;
+                    {
+                        std::lock_guard lk(replay_mtx);
+                        if (!free_pkts.empty()) {
+                            cpu_pkt = free_pkts.back();
+                            free_pkts.pop_back();
+                        }
+                    }
+                    if (!cpu_pkt) {
+                        cpu_pkt = av_packet_alloc();
+                        if (!cpu_pkt) {
+                            av_packet_unref(p);
+                            scratch = p;
+                            return std::unexpected("av_packet_alloc(replay) failed");
+                        }
+                    }
+                    if (av_new_packet(cpu_pkt, p->size) < 0 || av_packet_copy_props(cpu_pkt, p) < 0) {
+                        av_packet_free(&cpu_pkt);
+                        av_packet_unref(p);
+                        scratch = p;
+                        return std::unexpected("av_new_packet(replay) failed");
+                    }
+                    if (p->size > 0) {
+                        std::memcpy(cpu_pkt->data, p->data, static_cast<size_t>(p->size));
+                    }
+                    av_packet_unref(p);
+                    scratch = p;
+
+                    std::lock_guard lk(replay_mtx);
+                    push_replay_packet_locked(cpu_pkt, true);
+                } else {
+                    // Audio packets (Opus/AAC/FLAC) are already plain CPU buffers: zero-copy push
+                    std::lock_guard lk(replay_mtx);
+                    push_replay_packet_locked(p, false);
+                    if (!free_pkts.empty()) {
+                        scratch = free_pkts.back();
+                        free_pkts.pop_back();
+                    }
+                }
+                continue;
+            }
+
+            p->stream_index = st->index;
+            av_packet_rescale_ts(p, ctx->time_base, st->time_base);
 
             std::unique_lock lk(pkt_mtx);
             if (!writer_err.empty()) {
@@ -333,6 +641,8 @@ struct VideoEncoder::Impl {
 
     ~Impl() {
         stop_writer();
+        stop_saver();
+        clear_replay_buffers();
         if (scratch_pkt) av_packet_free(&scratch_pkt);
         if (audio_scratch_pkt) av_packet_free(&audio_scratch_pkt);
         if (audio_frame) av_frame_free(&audio_frame);
@@ -360,6 +670,7 @@ std::expected<std::unique_ptr<VideoEncoder>, std::string> VideoEncoder::open(
     enc->impl_ = std::make_unique<Impl>();
     Impl *impl = enc->impl_.get();
     impl->cfg = cfg;
+    impl->is_replay = (cfg.replay_seconds > 0);
 
     int err = avformat_alloc_output_context2(&impl->fmt_ctx, nullptr, nullptr, cfg.output_path.c_str());
     if (err < 0 || !impl->fmt_ctx) {
@@ -565,6 +876,21 @@ std::expected<std::unique_ptr<VideoEncoder>, std::string> VideoEncoder::open(
         }
     }
 
+    if (impl->is_replay) {
+        // Instant replay mode: do not open output file yet; packets stay in rolling RAM ring
+        // and are muxed asynchronously on a low-priority thread only when save_replay_async() is called.
+        impl->free_pkts.reserve(32);
+        impl->start_saver();
+        if (cfg.verbose) {
+            std::cerr << std::format(
+                "[encoder] opened {} {}x{} pixfmt={} qp={} quality={} gop={} async_depth={} (instant-replay {}s)\n",
+                cname, width, height,
+                cfg.pixfmt == PixelFormat::P010 ? "p010" : "nv12",
+                eff_qp, eff_quality, eff_idr, cfg.async_depth, cfg.replay_seconds);
+        }
+        return enc;
+    }
+
     if (!(impl->fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
         const std::string resolved_out = expand_user_path(cfg.output_path);
         std::filesystem::path out_p(resolved_out);
@@ -621,6 +947,7 @@ std::expected<void, std::string> VideoEncoder::encode_frame(AVFrame *frame, int6
 
     int err = avcodec_send_frame(impl_->enc_ctx, frame);
     if (err < 0) {
+        impl_->encode_failed = true;
         return std::unexpected(std::format("avcodec_send_frame failed: {}", ff_err(err)));
     }
     return impl_->drain_packets();
@@ -669,12 +996,17 @@ std::expected<void, std::string> VideoEncoder::finish() {
     if (impl_->finished) return {};
     impl_->finished = true;
 
-    int err = avcodec_send_frame(impl_->enc_ctx, nullptr);
-    if (err < 0 && err != AVERROR_EOF) {
-        impl_->stop_writer();
-        return std::unexpected(std::format("avcodec_send_frame(flush) failed: {}", ff_err(err)));
+    std::expected<void, std::string> res{};
+    if (!impl_->encode_failed) {
+        int err = avcodec_send_frame(impl_->enc_ctx, nullptr);
+        if (err < 0 && err != AVERROR_EOF) {
+            impl_->stop_writer();
+            impl_->stop_saver();
+            impl_->clear_replay_buffers();
+            return std::unexpected(std::format("avcodec_send_frame(flush) failed: {}", ff_err(err)));
+        }
+        res = impl_->drain_packets();
     }
-    auto res = impl_->drain_packets();
 
     std::expected<void, std::string> ares{};
     if (impl_->audio_enc_ctx) {
@@ -686,6 +1018,8 @@ std::expected<void, std::string> VideoEncoder::finish() {
     }
 
     impl_->stop_writer();
+    impl_->stop_saver();
+    impl_->clear_replay_buffers();
     if (!res) return res;
     if (!ares) return ares;
     if (!impl_->writer_err.empty()) {
@@ -693,9 +1027,9 @@ std::expected<void, std::string> VideoEncoder::finish() {
     }
 
     if (impl_->header_written) {
-        err = av_write_trailer(impl_->fmt_ctx);
-        if (err < 0) {
-            return std::unexpected(std::format("av_write_trailer failed: {}", ff_err(err)));
+        int terr = av_write_trailer(impl_->fmt_ctx);
+        if (terr < 0) {
+            return std::unexpected(std::format("av_write_trailer failed: {}", ff_err(terr)));
         }
     }
     return {};
@@ -712,6 +1046,137 @@ int VideoEncoder::audio_frame_size() const noexcept {
 
 Codec VideoEncoder::active_codec() const noexcept {
     return impl_->cfg.codec;
+}
+
+bool VideoEncoder::replay_mode() const noexcept {
+    return impl_->is_replay;
+}
+
+ReplayStats VideoEncoder::replay_stats() const noexcept {
+    if (!impl_->is_replay) return {};
+    std::lock_guard lk(impl_->replay_mtx);
+    double sec = 0.0;
+    if (impl_->replay_v_pkts.size() >= 2) {
+        const int64_t span = impl_->replay_v_pkts.back()->pts - impl_->replay_v_pkts.front()->pts;
+        sec = static_cast<double>(std::max<int64_t>(0, span)) * av_q2d(impl_->enc_ctx->time_base);
+    }
+    return {
+        impl_->replay_bytes,
+        sec,
+        impl_->replay_clips_saved.load(std::memory_order_relaxed),
+    };
+}
+
+std::expected<std::string, std::string> VideoEncoder::save_replay_async(std::string_view out_path_override) {
+    if (!impl_->is_replay) {
+        return std::unexpected("save_replay_async() called when instant replay mode is disabled");
+    }
+
+    Impl::SaveJob job{};
+    {
+        std::lock_guard lk(impl_->replay_mtx);
+        if (impl_->replay_v_pkts.empty()) {
+            return std::unexpected("Replay buffer is empty (no encoded frames yet)");
+        }
+
+        // Start from the oldest keyframe inside the rolling buffer
+        size_t first_kf = impl_->replay_v_pkts.size();
+        for (size_t i = 0; i < impl_->replay_v_pkts.size(); ++i) {
+            if ((impl_->replay_v_pkts[i]->flags & AV_PKT_FLAG_KEY) != 0) {
+                first_kf = i;
+                break;
+            }
+        }
+        if (first_kf == impl_->replay_v_pkts.size()) {
+            return std::unexpected("Replay buffer has no keyframe yet");
+        }
+
+        const int64_t v_base_pts = impl_->replay_v_pkts[first_kf]->pts;
+        const int64_t v_base_dts = (impl_->replay_v_pkts[first_kf]->dts != AV_NOPTS_VALUE)
+            ? impl_->replay_v_pkts[first_kf]->dts : v_base_pts;
+        const int64_t v_last_pts = impl_->replay_v_pkts.back()->pts;
+        job.duration_sec = static_cast<double>(std::max<int64_t>(0, v_last_pts - v_base_pts + 1)) *
+                           av_q2d(impl_->enc_ctx->time_base);
+
+        // Zero-copy shallow packet references (AVBufferRef refcount++, no bitstream memcpy)
+        job.v_pkts.reserve(impl_->replay_v_pkts.size() - first_kf);
+        for (size_t i = first_kf; i < impl_->replay_v_pkts.size(); ++i) {
+            AVPacket *ref = av_packet_alloc();
+            if (!ref || av_packet_ref(ref, impl_->replay_v_pkts[i]) < 0) {
+                if (ref) av_packet_free(&ref);
+                Impl::free_save_job(job);
+                return std::unexpected("av_packet_ref(video) failed");
+            }
+            if (ref->pts != AV_NOPTS_VALUE) ref->pts -= v_base_pts;
+            if (ref->dts != AV_NOPTS_VALUE) ref->dts -= v_base_dts;
+            job.v_pkts.push_back(ref);
+        }
+
+        if (impl_->audio_enc_ctx && !impl_->replay_a_pkts.empty()) {
+            const int64_t a_start_pts = av_rescale_q(v_base_pts, impl_->enc_ctx->time_base,
+                                                     impl_->audio_enc_ctx->time_base);
+            job.a_pkts.reserve(impl_->replay_a_pkts.size());
+            for (AVPacket *src : impl_->replay_a_pkts) {
+                if (src->pts < a_start_pts) continue;
+                AVPacket *ref = av_packet_alloc();
+                if (!ref || av_packet_ref(ref, src) < 0) {
+                    if (ref) av_packet_free(&ref);
+                    Impl::free_save_job(job);
+                    return std::unexpected("av_packet_ref(audio) failed");
+                }
+                if (ref->pts != AV_NOPTS_VALUE) ref->pts -= a_start_pts;
+                if (ref->dts != AV_NOPTS_VALUE) ref->dts -= a_start_pts;
+                job.a_pkts.push_back(ref);
+            }
+        }
+    }
+
+    job.v_par = avcodec_parameters_alloc();
+    if (!job.v_par || avcodec_parameters_from_context(job.v_par, impl_->enc_ctx) < 0) {
+        Impl::free_save_job(job);
+        return std::unexpected("Failed to copy replay video codec parameters");
+    }
+    job.v_tb = impl_->enc_ctx->time_base;
+    job.v_fps = impl_->enc_ctx->framerate;
+
+    if (impl_->audio_enc_ctx) {
+        job.a_par = avcodec_parameters_alloc();
+        if (!job.a_par || avcodec_parameters_from_context(job.a_par, impl_->audio_enc_ctx) < 0) {
+            Impl::free_save_job(job);
+            return std::unexpected("Failed to copy replay audio codec parameters");
+        }
+        job.a_tb = impl_->audio_enc_ctx->time_base;
+    }
+
+    if (!out_path_override.empty()) {
+        job.out_path = expand_user_path(out_path_override);
+    } else {
+        std::filesystem::path base_p(expand_user_path(impl_->cfg.output_path));
+        std::string ext = base_p.extension().string();
+        if (ext != ".mkv" && ext != ".mp4" && ext != ".webm" && ext != ".ivf") ext = ".mkv";
+        std::time_t now = std::time(nullptr);
+        std::tm tm{};
+        localtime_r(&now, &tm);
+        char ts[64];
+        std::strftime(ts, sizeof(ts), "vkcap_replay_%Y%m%d_%H%M%S", &tm);
+        const uint32_t seq = ++impl_->replay_save_seq;
+        std::string fname = (seq > 1)
+            ? std::format("{}_{}{}", ts, seq, ext)
+            : std::format("{}{}", ts, ext);
+        if (base_p.has_parent_path()) {
+            job.out_path = (base_p.parent_path() / fname).string();
+        } else {
+            job.out_path = fname;
+        }
+    }
+
+    const std::string out_path = job.out_path;
+    {
+        std::lock_guard lk(impl_->save_mtx);
+        impl_->save_queue.push_back(std::move(job));
+    }
+    impl_->save_cv.notify_one();
+    return out_path;
 }
 
 EncoderStats VideoEncoder::stats() const noexcept {

@@ -79,6 +79,7 @@ struct SrcBinding {
 
 struct CachedSrcImage {
     uint64_t inode_key = 0;
+    uint64_t last_used_frame = 0;
     VkImage image = VK_NULL_HANDLE;
     std::array<VkDeviceMemory, 4> mem{};
     uint32_t num_mems = 0;
@@ -281,9 +282,11 @@ struct VulkanCompute::Impl {
     CachedSrcImage dummy_cursor{};
 
     static constexpr size_t kNumSlots = 4;
-    static constexpr size_t kMaxCachedSurfaces = 12;
+    static constexpr size_t kMaxCachedSurfaces = 6;
+    static constexpr uint64_t kStaleSurfaceFrames = 180;
     std::array<CmdSlot, kNumSlots> slots{};
     size_t slot_cursor = 0;
+    uint64_t frame_seq = 0;
 
     // Flat L1-cache-resident MRU tables (no mutex or hash overhead on single capture thread)
     std::vector<CachedSrcImage> src_cache;
@@ -999,6 +1002,14 @@ struct VulkanCompute::Impl {
         return out;
     }
 
+    void evict_stale_src_surfaces() {
+        while (!src_cache.empty() &&
+               (frame_seq - src_cache.back().last_used_frame) > kStaleSurfaceFrames) {
+            destroy_src_image(src_cache.back());
+            src_cache.pop_back();
+        }
+    }
+
     std::expected<SrcBinding, std::string> get_or_import_surface(const KmsSurface &surf) {
         // Flat MRU search: steady-state triple-buffered scanout hits index 0..2 in L1 cache
         for (size_t i = 0; i < src_cache.size(); ++i) {
@@ -1007,6 +1018,7 @@ struct VulkanCompute::Impl {
                 if (c.width == surf.width && c.height == surf.height &&
                     c.drm_fourcc == surf.drm_fourcc && c.modifier == surf.drm_modifier &&
                     c.has_modifier == surf.has_modifier) {
+                    c.last_used_frame = frame_seq;
                     if (i > 0) {
                         CachedSrcImage tmp = c;
                         for (size_t k = i; k > 0; --k) src_cache[k] = src_cache[k - 1];
@@ -1029,6 +1041,7 @@ struct VulkanCompute::Impl {
         auto imported = import_dmabuf(surf);
         if (!imported) return std::unexpected(imported.error());
         imported->inode_key = surf.inode_key;
+        imported->last_used_frame = frame_seq;
         src_cache.insert(src_cache.begin(), *imported);
         return SrcBinding{src_cache[0].image, src_cache[0].view};
     }
@@ -1225,7 +1238,7 @@ std::expected<void, std::string> VulkanCompute::configure_output(uint32_t width,
     fc->sw_format = (impl_->cfg.pixfmt == PixelFormat::P010) ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
     fc->width = static_cast<int>(width);
     fc->height = static_cast<int>(height);
-    fc->initial_pool_size = static_cast<int>(impl_->cfg.queue_size) + impl_->cfg.async_depth * 2 + 6;
+    fc->initial_pool_size = static_cast<int>(impl_->cfg.queue_size) + impl_->cfg.async_depth + 4;
     vkfc->usage = static_cast<VkImageUsageFlagBits>(
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -1278,6 +1291,11 @@ std::expected<void, std::string> VulkanCompute::configure_output(uint32_t width,
 
 std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFrame &kf) {
     if (!impl_->hw_frames_ref) return std::unexpected("VulkanCompute output not configured");
+
+    ++impl_->frame_seq;
+    if ((impl_->frame_seq % 60) == 0) {
+        impl_->evict_stale_src_surfaces();
+    }
 
     // LIFO pool probing using reusable empty AVFrame shells to avoid malloc/free thrashing
     size_t nb_busy = 0;

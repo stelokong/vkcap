@@ -268,6 +268,32 @@ std::expected<std::pair<uint32_t, uint32_t>, std::string> parse_resolution(const
     return std::pair<uint32_t, uint32_t>{w, h};
 }
 
+std::expected<CropRect, std::string> parse_crop(std::string_view str) {
+    // Expected format: WxH+X+Y (e.g. 1920x1080+320+180)
+    auto x_pos = str.find('x');
+    if (x_pos == std::string_view::npos) x_pos = str.find('X');
+    auto p1 = str.find('+');
+    auto p2 = (p1 != std::string_view::npos) ? str.find('+', p1 + 1) : std::string_view::npos;
+    if (x_pos == std::string_view::npos || p1 == std::string_view::npos ||
+        p2 == std::string_view::npos || x_pos == 0 || p1 <= x_pos + 1 ||
+        p2 <= p1 + 1 || p2 + 1 >= str.size()) {
+        return std::unexpected(std::format("Invalid crop '{}', expected WxH+X+Y (e.g. 1920x1080+320+180)", str));
+    }
+    auto parse_i32 = [](std::string_view s, int32_t &out) {
+        auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), out);
+        return ec == std::errc() && p == s.data() + s.size();
+    };
+    CropRect r{};
+    if (!parse_i32(str.substr(0, x_pos), r.width) ||
+        !parse_i32(str.substr(x_pos + 1, p1 - x_pos - 1), r.height) ||
+        !parse_i32(str.substr(p1 + 1, p2 - p1 - 1), r.x) ||
+        !parse_i32(str.substr(p2 + 1), r.y) ||
+        r.width < 2 || r.height < 2 || r.x < 0 || r.y < 0) {
+        return std::unexpected(std::format("Invalid crop '{}': width/height must be >= 2 and x/y >= 0", str));
+    }
+    return r;
+}
+
 void print_help(const char *prog_name) {
     std::cout <<
 R"(vkcap — Zero-copy Linux DRM/KMS -> Vulkan Compute -> Vulkan Video (AV1) screen recorder
@@ -286,8 +312,10 @@ Display Selection & Capture:
   -D, --display <name|idx>    Select display by connector (e.g. DP-1, HDMI-A-1) or index [default: auto]
   -o, --output <path>         Output file (.mkv, .mp4, .webm, .ivf) [default: vkcap_<ts>.mkv]
   -f, --fps <n>               Locked CFR capture framerate [default: 60]
-  -s, --scale <WxH>           Scale output via GPU Catmull-Rom bicubic filter (even WxH)
+  -s, --scale <WxH|preset>    Scale output via GPU Catmull-Rom bicubic (even WxH, or 720p/1080p/1440p/4k)
+      --crop <WxH+X+Y>        Zero-copy GPU crop region in display pixels (e.g. 1920x1080+320+180)
   -d, --duration <sec>        Stop recording automatically after <sec> seconds
+      --instant-replay [sec]  Enable rolling instant-replay buffer [default: 30s; save via SIGUSR2 or 's']
       --no-cursor             Disable GPU compositing of the hardware KMS cursor plane
 
 Audio Capture (PipeWire low-latency, system audio ON by default):
@@ -361,6 +389,8 @@ enum OptId {
     OPT_INPUT_GAMUT,
     OPT_NO_DITHER,
     OPT_QUEUE_SIZE,
+    OPT_CROP,
+    OPT_INSTANT_REPLAY,
 };
 
 template <typename T>
@@ -375,8 +405,13 @@ std::expected<T, std::string> parse_enum(std::string_view val,
 
 }  // namespace
 
-std::expected<Config, std::string> parse_args(int argc, char **argv) {
-    Config cfg;
+std::expected<Config, std::string> parse_args(int argc, char **argv, const Config *base_defaults) {
+    Config cfg = base_defaults ? *base_defaults : Config{};
+    // Never inherit a saved recording duration limit when seeding from defaults;
+    // explicit -d on the command line will still set it below.
+    if (base_defaults) {
+        cfg.duration_sec = 0.0;
+    }
 
     // Pre-scan for -p / --profile so explicit CLI flags always override profile settings
     // regardless of argument order (e.g. `-f 120 -p gameplay` and `-p gameplay -f 120`).
@@ -436,6 +471,9 @@ std::expected<Config, std::string> parse_args(int argc, char **argv) {
         {"input-gamut",       required_argument, nullptr, OPT_INPUT_GAMUT},
         {"no-dither",         no_argument,       nullptr, OPT_NO_DITHER},
         {"queue-size",        required_argument, nullptr, OPT_QUEUE_SIZE},
+        {"crop",              required_argument, nullptr, OPT_CROP},
+        {"instant-replay",    optional_argument, nullptr, OPT_INSTANT_REPLAY},
+        {"replay-buffer",     optional_argument, nullptr, OPT_INSTANT_REPLAY},
         {nullptr, 0, nullptr, 0},
     };
 
@@ -661,6 +699,33 @@ std::expected<Config, std::string> parse_args(int argc, char **argv) {
                 auto r = parse_int(optarg, 1, 64, "--queue-size");
                 if (!r) return std::unexpected(r.error());
                 cfg.queue_size = static_cast<size_t>(*r);
+                break;
+            }
+            case OPT_CROP: {
+                auto r = parse_crop(optarg);
+                if (!r) return std::unexpected(r.error());
+                cfg.crop = *r;
+                break;
+            }
+            case OPT_INSTANT_REPLAY: {
+                int sec = 30;
+                if (optarg && optarg[0] != '\0') {
+                    auto r = parse_int(optarg, 5, 600, "--instant-replay");
+                    if (!r) return std::unexpected(r.error());
+                    sec = *r;
+                } else if (optind < argc && argv[optind] && std::isdigit(static_cast<unsigned char>(argv[optind][0]))) {
+                    int parsed = 0;
+                    std::string_view next(argv[optind]);
+                    auto [p, ec] = std::from_chars(next.data(), next.data() + next.size(), parsed);
+                    if (ec == std::errc() && p == next.data() + next.size()) {
+                        if (parsed < 5 || parsed > 600) {
+                            return std::unexpected(std::format("Invalid integer '{}' for --instant-replay (5..600)", next));
+                        }
+                        sec = parsed;
+                        ++optind;
+                    }
+                }
+                cfg.replay_seconds = static_cast<uint32_t>(sec);
                 break;
             }
             default:

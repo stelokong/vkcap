@@ -12,9 +12,12 @@
 #include <format>
 #include <iostream>
 #include <mutex>
+#include <poll.h>
 #include <pthread.h>
 #include <sys/prctl.h>
+#include <termios.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 extern "C" {
@@ -114,9 +117,44 @@ private:
     uint64_t dropped_ = 0;
 };
 
+struct ScopedRawKeyReader {
+    bool active = false;
+    termios orig{};
+
+    explicit ScopedRawKeyReader(bool enable) noexcept {
+        if (enable && ::isatty(STDIN_FILENO) != 0 && ::tcgetattr(STDIN_FILENO, &orig) == 0) {
+            termios raw = orig;
+            raw.c_lflag &= ~static_cast<tcflag_t>(ICANON | ECHO);
+            raw.c_cc[VMIN] = 0;
+            raw.c_cc[VTIME] = 0;
+            if (::tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
+                active = true;
+            }
+        }
+    }
+
+    ~ScopedRawKeyReader() {
+        if (active) {
+            ::tcsetattr(STDIN_FILENO, TCSANOW, &orig);
+        }
+    }
+
+    char poll_key() const noexcept {
+        if (!active) return '\0';
+        pollfd pfd{STDIN_FILENO, POLLIN, 0};
+        if (::poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN) != 0) {
+            char ch = '\0';
+            if (::read(STDIN_FILENO, &ch, 1) == 1) return ch;
+        }
+        return '\0';
+    }
+};
+
 }  // namespace
 
-std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic<bool> &stop_flag) {
+std::expected<void, std::string> run_kms_pipeline(const Config &cfg, PipelineSignals &signals) {
+    auto &stop_flag = signals.stop;
+
     auto kms_res = KmsCapture::open(cfg);
     if (!kms_res) return std::unexpected(kms_res.error());
     auto kms = std::move(*kms_res);
@@ -131,8 +169,28 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
 
     const uint32_t src_w = first_res->primary.width;
     const uint32_t src_h = first_res->primary.height;
-    const uint32_t enc_w = cfg.out_width ? cfg.out_width : (src_w & ~1u);
-    const uint32_t enc_h = cfg.out_height ? cfg.out_height : (src_h & ~1u);
+
+    CropRect eff_crop{};
+    if (cfg.crop.valid()) {
+        if (static_cast<uint32_t>(cfg.crop.x) >= src_w || static_cast<uint32_t>(cfg.crop.y) >= src_h) {
+            return std::unexpected(std::format(
+                "Crop origin ({},{}) is outside display scanout ({}x{})",
+                cfg.crop.x, cfg.crop.y, src_w, src_h));
+        }
+        eff_crop.x = cfg.crop.x;
+        eff_crop.y = cfg.crop.y;
+        eff_crop.width = std::min<int32_t>(cfg.crop.width, static_cast<int32_t>(src_w) - eff_crop.x);
+        eff_crop.height = std::min<int32_t>(cfg.crop.height, static_cast<int32_t>(src_h) - eff_crop.y);
+        if (eff_crop.width < 2 || eff_crop.height < 2) {
+            return std::unexpected("Clamped crop region must be at least 2x2 pixels");
+        }
+        first_res->crop = eff_crop;
+    }
+
+    const uint32_t active_w = eff_crop.valid() ? static_cast<uint32_t>(eff_crop.width) : src_w;
+    const uint32_t active_h = eff_crop.valid() ? static_cast<uint32_t>(eff_crop.height) : src_h;
+    const uint32_t enc_w = cfg.out_width ? cfg.out_width : (active_w & ~1u);
+    const uint32_t enc_h = cfg.out_height ? cfg.out_height : (active_h & ~1u);
 
     auto vk_res = VulkanCompute::create(cfg, gamut.enabled, gamut.matrix, disp.card_path);
     if (!vk_res) return std::unexpected(vk_res.error());
@@ -199,13 +257,27 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
 
     const char *vcodec_str = (encoder->active_codec() == Codec::Av1) ? "AV1"
                            : (encoder->active_codec() == Codec::Hevc) ? "HEVC" : "H.264";
-    std::cerr << std::format(
-        "[vkcap] Recording {} ({} {}x{}@{:.1f}Hz -> {}x{}, {} {}, CFR {}fps{})\n"
-        "[vkcap] Color gamut: {} | Audio: {}\n",
-        cfg.output_path, disp.connector_name, src_w, src_h, disp.refresh_hz, enc_w, enc_h,
-        vcodec_str, cfg.pixfmt == PixelFormat::P010 ? "10-bit P010" : "8-bit NV12",
-        cfg.fps, cfg.capture_cursor ? ", hw-cursor" : "",
-        gamut.description, audio_desc);
+    const std::string crop_str = eff_crop.valid()
+        ? std::format(", crop {}x{}+{}+{}", eff_crop.width, eff_crop.height, eff_crop.x, eff_crop.y)
+        : "";
+    if (encoder->replay_mode()) {
+        std::cerr << std::format(
+            "[vkcap] Instant Replay ({}s rolling buffer, {} {}x{}@{:.1f}Hz -> {}x{}, {} {}, CFR {}fps{}{})\n"
+            "[vkcap] Color gamut: {} | Audio: {}\n"
+            "[vkcap] Press 's'/Enter (or send SIGUSR2) to save replay, Ctrl+C to stop.\n",
+            cfg.replay_seconds, disp.connector_name, src_w, src_h, disp.refresh_hz, enc_w, enc_h,
+            vcodec_str, cfg.pixfmt == PixelFormat::P010 ? "10-bit P010" : "8-bit NV12",
+            cfg.fps, crop_str, cfg.capture_cursor ? ", hw-cursor" : "",
+            gamut.description, audio_desc);
+    } else {
+        std::cerr << std::format(
+            "[vkcap] Recording {} ({} {}x{}@{:.1f}Hz -> {}x{}, {} {}, CFR {}fps{}{})\n"
+            "[vkcap] Color gamut: {} | Audio: {}\n",
+            cfg.output_path, disp.connector_name, src_w, src_h, disp.refresh_hz, enc_w, enc_h,
+            vcodec_str, cfg.pixfmt == PixelFormat::P010 ? "10-bit P010" : "8-bit NV12",
+            cfg.fps, crop_str, cfg.capture_cursor ? ", hw-cursor" : "",
+            gamut.description, audio_desc);
+    }
 
     EncodeFrameQueue encode_queue(cfg.queue_size);
     std::mutex err_mtx;
@@ -246,18 +318,28 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
                 double avg_comp_ms = cst.frames_processed > 0
                     ? (static_cast<double>(cst.total_compute_ns) / static_cast<double>(cst.frames_processed)) / 1e6
                     : 0.0;
-                const int total_sec = static_cast<int>(elapsed_total);
-                const int hrs = total_sec / 3600;
-                const int mins = (total_sec % 3600) / 60;
-                const int secs = total_sec % 60;
-                const std::string time_str = (hrs > 0)
-                    ? std::format("{}:{:02d}:{:02d}", hrs, mins, secs)
-                    : std::format("{:02d}:{:02d}", mins, secs);
-                const double mib = static_cast<double>(est.bytes_written) / (1024.0 * 1024.0);
-                std::cerr << std::format(
-                    "\r[vkcap] {} | {:.1f} fps | {} frames | {} dropped | {:.2f} Mbps ({:.1f} MiB) | compute {:.2f} ms/f   ",
-                    time_str, inst_fps, est.frames_submitted, encode_queue.dropped(), mbps, mib, avg_comp_ms)
-                          << std::flush;
+                if (encoder->replay_mode()) {
+                    auto rst = encoder->replay_stats();
+                    std::cerr << std::format(
+                        "\r[vkcap] REPLAY | {:.1f} fps | buf {:.1f}s ({:.1f} MiB) | saved {} | compute {:.2f} ms/f   ",
+                        inst_fps, rst.buffered_sec,
+                        static_cast<double>(rst.buffered_bytes) / (1024.0 * 1024.0),
+                        rst.clips_saved, avg_comp_ms)
+                              << std::flush;
+                } else {
+                    const int total_sec = static_cast<int>(elapsed_total);
+                    const int hrs = total_sec / 3600;
+                    const int mins = (total_sec % 3600) / 60;
+                    const int secs = total_sec % 60;
+                    const std::string time_str = (hrs > 0)
+                        ? std::format("{}:{:02d}:{:02d}", hrs, mins, secs)
+                        : std::format("{:02d}:{:02d}", mins, secs);
+                    const double mib = static_cast<double>(est.bytes_written) / (1024.0 * 1024.0);
+                    std::cerr << std::format(
+                        "\r[vkcap] {} | {:.1f} fps | {} frames | {} dropped | {:.2f} Mbps ({:.1f} MiB) | compute {:.2f} ms/f   ",
+                        time_str, inst_fps, est.frames_submitted, encode_queue.dropped(), mbps, mib, avg_comp_ms)
+                              << std::flush;
+                }
                 last_enc_frames = est.frames_submitted;
                 last_report = now;
             }
@@ -269,6 +351,7 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
     ::prctl(PR_SET_TIMERSLACK, 1, 0, 0, 0);
     const int64_t frame_interval_ns = 1'000'000'000LL / std::max<uint32_t>(1u, cfg.fps);
     int64_t base_ns = monotonic_now_ns();
+    std::atomic<int64_t> pause_offset_ns{0};
     int64_t frame_idx = 0;
 
     // Stage 1b: Wall-clock mastered Opus audio encoder thread (locked to exact same base_ns)
@@ -285,7 +368,11 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
             int64_t a_idx = 0;
             while (!audio_stop.load(std::memory_order_acquire) &&
                    !stop_flag.load(std::memory_order_acquire)) {
-                const int64_t target_ns = base_ns +
+                if (signals.paused.load(std::memory_order_acquire)) {
+                    sleep_until_monotonic_ns(monotonic_now_ns() + 20'000'000LL);
+                    continue;
+                }
+                const int64_t target_ns = base_ns + pause_offset_ns.load(std::memory_order_acquire) +
                     ((a_idx + 1) * static_cast<int64_t>(a_frame_sz) * 1'000'000'000LL) /
                     static_cast<int64_t>(a_rate);
                 if (monotonic_now_ns() < target_ns) {
@@ -294,6 +381,9 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
                 if (audio_stop.load(std::memory_order_acquire) ||
                     stop_flag.load(std::memory_order_acquire)) {
                     break;
+                }
+                if (signals.paused.load(std::memory_order_acquire)) {
+                    continue;
                 }
                 audio->read_mixed_frames(pcm.data(), static_cast<size_t>(a_frame_sz));
                 auto aerr = encoder->encode_audio_samples(
@@ -317,20 +407,62 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
         }
     }
 
+    ScopedRawKeyReader key_reader(encoder->replay_mode());
     const int64_t end_ns = (cfg.duration_sec > 0.0)
         ? (base_ns + static_cast<int64_t>(cfg.duration_sec * 1e9))
         : 0;
 
     while (!stop_flag.load(std::memory_order_acquire)) {
-        int64_t target_ns = base_ns + (frame_idx * 1'000'000'000LL) / static_cast<int64_t>(cfg.fps);
+        // Check non-blocking terminal keypresses in instant-replay mode (~6 Hz, zero overhead)
+        if (key_reader.active && (frame_idx % 10) == 0) {
+            const char ch = key_reader.poll_key();
+            if (ch == 's' || ch == 'S' || ch == '\n' || ch == ' ') {
+                signals.save_replay.store(true, std::memory_order_release);
+            } else if (ch == 'p' || ch == 'P') {
+                bool cur = signals.paused.load(std::memory_order_relaxed);
+                signals.paused.store(!cur, std::memory_order_release);
+            } else if (ch == 'q' || ch == 'Q') {
+                stop_flag.store(true, std::memory_order_release);
+                break;
+            }
+        }
+
+        // Trigger zero-copy async replay save on SIGUSR2 or keypress
+        if (encoder->replay_mode() && signals.save_replay.exchange(false, std::memory_order_acq_rel)) {
+            auto sres = encoder->save_replay_async();
+            if (!sres) {
+                std::cerr << "\n[vkcap] Replay save skipped: " << sres.error() << '\n' << std::flush;
+            } else {
+                std::cerr << "\n[vkcap] Saving replay -> '" << *sres << "'...\n" << std::flush;
+            }
+        }
+
+        // Handle SIGUSR1 pause/resume cleanly while preserving continuous A/V timestamps
+        if (signals.paused.load(std::memory_order_acquire)) {
+            const int64_t p_start = monotonic_now_ns();
+            std::cerr << "\n[vkcap] Paused (send SIGUSR1 to resume)...\n" << std::flush;
+            while (signals.paused.load(std::memory_order_acquire) &&
+                   !stop_flag.load(std::memory_order_acquire)) {
+                sleep_until_monotonic_ns(monotonic_now_ns() + 50'000'000LL);
+            }
+            if (stop_flag.load(std::memory_order_acquire)) break;
+            const int64_t p_dur = monotonic_now_ns() - p_start;
+            pause_offset_ns.fetch_add(p_dur, std::memory_order_release);
+            if (audio) audio->reset_sync();
+            std::cerr << "[vkcap] Resumed.\n" << std::flush;
+            continue;
+        }
+
+        const int64_t p_off = pause_offset_ns.load(std::memory_order_relaxed);
+        int64_t target_ns = base_ns + p_off + (frame_idx * 1'000'000'000LL) / static_cast<int64_t>(cfg.fps);
         int64_t now_ns = monotonic_now_ns();
-        if (end_ns > 0 && now_ns >= end_ns) {
+        if (end_ns > 0 && now_ns >= (end_ns + p_off)) {
             break;
         }
         if (now_ns < target_ns) {
             sleep_until_monotonic_ns(target_ns);
         } else if (now_ns - target_ns > frame_interval_ns * 2) {
-            base_ns = now_ns - (frame_idx * 1'000'000'000LL) / static_cast<int64_t>(cfg.fps);
+            base_ns = now_ns - p_off - (frame_idx * 1'000'000'000LL) / static_cast<int64_t>(cfg.fps);
         }
 
         if (stop_flag.load(std::memory_order_acquire)) break;
@@ -343,6 +475,9 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
             }
             frame_idx++;
             continue;
+        }
+        if (eff_crop.valid()) {
+            frame_res->crop = eff_crop;
         }
 
         auto gpu_res = vk->process_frame(*frame_res);
@@ -370,10 +505,17 @@ std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic
     double avg_comp_ms = cst.frames_processed > 0
         ? (static_cast<double>(cst.total_compute_ns) / static_cast<double>(cst.frames_processed)) / 1e6
         : 0.0;
-    std::cerr << std::format(
-        "[vkcap] Saved '{}' ({} frames, {:.1f}s, {:.1f} avg fps, {} dropped, {:.2f} MiB, compute {:.2f} ms/f)\n",
-        cfg.output_path, est.frames_submitted, elapsed, avg_fps, encode_queue.dropped(),
-        static_cast<double>(est.bytes_written) / (1024.0 * 1024.0), avg_comp_ms);
+    if (encoder->replay_mode()) {
+        auto rst = encoder->replay_stats();
+        std::cerr << std::format(
+            "[vkcap] Instant Replay stopped ({} frames buffered, {:.1f}s, {} clip(s) saved, compute {:.2f} ms/f)\n",
+            est.frames_submitted, elapsed, rst.clips_saved, avg_comp_ms);
+    } else {
+        std::cerr << std::format(
+            "[vkcap] Saved '{}' ({} frames, {:.1f}s, {:.1f} avg fps, {} dropped, {:.2f} MiB, compute {:.2f} ms/f)\n",
+            cfg.output_path, est.frames_submitted, elapsed, avg_fps, encode_queue.dropped(),
+            static_cast<double>(est.bytes_written) / (1024.0 * 1024.0), avg_comp_ms);
+    }
 
     std::lock_guard lk(err_mtx);
     if (!async_err.empty()) return std::unexpected(async_err);

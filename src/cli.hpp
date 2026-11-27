@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -32,7 +34,9 @@ struct Config {
     uint32_t fps = 60;
     uint32_t out_width = 0;   // 0 = native capture width
     uint32_t out_height = 0;  // 0 = native capture height
+    CropRect crop{};          // Optional GPU crop region (WxH+X+Y)
     double duration_sec = 0.0;
+    uint32_t replay_seconds = 0;  // >0 = instant replay mode (rolling buffer in seconds)
     bool capture_cursor = true;
 
     // Audio capture (PipeWire low-latency, system audio ON by default, mic OFF by default)
@@ -81,10 +85,11 @@ std::span<const ProfileInfo> builtin_profiles() noexcept;
 std::expected<void, std::string> apply_profile(Config &cfg, std::string_view name);
 void print_profiles();
 
-std::expected<Config, std::string> parse_args(int argc, char **argv);
+std::expected<Config, std::string> parse_args(int argc, char **argv, const Config *base_defaults = nullptr);
 std::expected<int64_t, std::string> parse_bitrate(const std::string &str);
 std::expected<double, std::string> parse_volume_pct(std::string_view str);
 std::expected<std::pair<uint32_t, uint32_t>, std::string> parse_resolution(const std::string &str);
+std::expected<CropRect, std::string> parse_crop(std::string_view str);
 constexpr int max_qp_for_codec(Codec c) noexcept { return c == Codec::Av1 ? 255 : 51; }
 constexpr int default_qp_for_codec(Codec c) noexcept { return c == Codec::Av1 ? 52 : 22; }
 void print_help(const char *prog_name);

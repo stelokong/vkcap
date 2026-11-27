@@ -8,6 +8,12 @@
 
 namespace vkcap {
 
-std::expected<void, std::string> run_kms_pipeline(const Config &cfg, std::atomic<bool> &stop_flag);
+struct PipelineSignals {
+    std::atomic<bool> stop{false};
+    std::atomic<bool> paused{false};
+    std::atomic<bool> save_replay{false};
+};
+
+std::expected<void, std::string> run_kms_pipeline(const Config &cfg, PipelineSignals &signals);
 
 }  // namespace vkcap

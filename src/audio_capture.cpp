@@ -171,6 +171,20 @@ void on_stream_process(void *userdata) {
             const size_t nframes = chunk->size / stride;
             if (cs->channels == 2) {
                 cs->ring.push_frames(samples, nframes);
+            } else if (cs->channels == 1) {
+                // Mono Pro-Audio / JACK fallback: duplicate mono -> interleaved stereo on stack (0 allocs)
+                float stereo[512];
+                size_t pos = 0;
+                while (pos < nframes) {
+                    const size_t chunk_n = std::min<size_t>(256, nframes - pos);
+                    for (size_t i = 0; i < chunk_n; ++i) {
+                        const float s = samples[pos + i];
+                        stereo[i * 2] = s;
+                        stereo[i * 2 + 1] = s;
+                    }
+                    cs->ring.push_frames(stereo, chunk_n);
+                    pos += chunk_n;
+                }
             }
         }
     }
