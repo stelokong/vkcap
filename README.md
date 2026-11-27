@@ -197,7 +197,7 @@ While recording, `vkcap` prints a live single-line status bar with elapsed time,
 | `--color-space <cs>` | `bt709` | Output color space: `bt709` or `bt2020` |
 | `--no-dither` | off | Disable static spatial IGN dithering for 8-bit NV12 |
 | `--queue-size <n>` | `4` | Bounded GPU-to-encoder ring buffer depth |
-| `-v, --verbose` | off | Print DRM/KMS plane, Vulkan, audio, and encoder telemetry |
+| `-v, --verbose` | off | Print DRM/KMS, Vulkan, encoder, frame-pacing jitter, and audio sync skew telemetry |
 | `-h, --help` | — | Show CLI help |
 
 ---
@@ -224,30 +224,31 @@ While recording, `vkcap` prints a live single-line status bar with elapsed time,
   │                        ZERO-COPY VIDEO PATH                             │
   │                                                                         │
   │  DRM/KMS Primary Plane (FB2) ─┐                                         │
-  │  DRM/KMS Cursor Plane  (FB2) ─┼─▶ [vkcap] Direct stack ioctls           │
-  │  (single ScopedCapSysAdmin)   │   CLOCK_MONOTONIC + PR_SET_TIMERSLACK   │
+  │  DRM/KMS Cursor Plane  (FB2) ─┼─▶ [vkcap] Direct stack ioctls (nice -5) │
+  │  (cursor cache + dedup skip)  │   Rational vblank pacer + TIMER_ABSTIME │
   │                               │       │                                 │
-  │                               │       ▼ DMA-BUF fd (st_ino MRU cache)   │
+  │                               │       ▼ DMA-BUF fd (12-entry MRU cache) │
   │                               │   Isolated Low-Priority Vulkan Compute  │
-  │                               │   Device (compute_dev, priority 0.0)    │
+  │                               │   Device (compute_dev, async CmdSlots)  │
   │                               │   rgb_to_yuv.comp (16×4, subgroupUp,    │
   │                               │   hw cursor, EDID gamut, IGN dither)    │
   │                               │       │                                 │
   │                               │       ▼ OPAQUE_FD alias → AVVkFrame     │
-  │                               │   Fixed Ring EncodeFrameQueue (depth 4) │
+  │                               │   EncodeFrameQueue (async fence handoff │
+  │                               │   + zero-compute av_frame_clone reuse)  │
   │                               │       │                                 │
   │                               │       ▼                                 │
-  │                               │   [vkcap-enc] FFmpeg Vulkan Video       │
+  │                               │   [vkcap-enc] wait_slot → Vulkan Video  │
   │                               │   (av1_vulkan / hevc_vulkan / h264)     │
   │                               └───────┼─────────────────────┐           │
   └───────────────────────────────────────┼─────────────────────┼───────────┘
                                           │                     │
   ┌───────────────────────────────────────┼─────────────────────┼───────────┐
-  │                       LOW-LATENCY AUDIO PATH                │           │
+  │                  ZERO-DRIFT LOW-LATENCY AUDIO PATH          │           │
   │                                                             │           │
-  │  PipeWire Sink Monitor (20ms F32) ─▶ Lock-free SPSC Ring ──┐│           │
-  │  PipeWire Selected Mic (20ms F32) ─▶ Lock-free SPSC Ring ──┼┤           │
-  │  [vkcap-audio-pw RT thread]                                ││           │
+  │  PipeWire Sink Monitor (F32) ─▶ Lock-free SPSC + PI Cubic ─┐│           │
+  │  PipeWire Selected Mic (F32) ─▶ Lock-free SPSC + PI Cubic ─┼┤           │
+  │  [vkcap-audio-pw RT thread]     (42.7ms cushion, 2-pole LP)││           │
   │                                                            ▼▼           │
   │  [vkcap-aenc] Wall-clock 20ms tick (same base_ns)     [vkcap-mux]       │
   │  Gain (sys/mic %) + soft-limit → Opus/AAC/FLAC ───▶ Recycled AVPacket   │

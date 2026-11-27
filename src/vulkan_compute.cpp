@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <fcntl.h>
 #include <filesystem>
 #include <format>
@@ -18,6 +19,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -108,6 +110,8 @@ struct CmdSlot {
     VkSemaphore ext_wait_sem = VK_NULL_HANDLE;
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     VkDescriptorSet desc_set = VK_NULL_HANDLE;
+    std::atomic<bool> in_use{false};
+    std::chrono::steady_clock::time_point submit_t0{};
 };
 
 // Matches a DRM /dev/dri/card* node to its Vulkan physical device index via VK_EXT_physical_device_drm.
@@ -215,86 +219,97 @@ GpuEncodeSupport probe_gpu_encode_support(uint32_t device_index,
                 std::vector<VkExtensionProperties> exts(ext_cnt);
                 vkEnumerateDeviceExtensionProperties(phys, nullptr, &ext_cnt, exts.data());
                 out.probed = true;
-                out.has_av1 = false;
-                out.has_hevc = false;
-                out.has_h264 = false;
+                out.av1 = {};
+                out.hevc = {};
+                out.h264 = {};
                 for (const auto &e : exts) {
-                    if (std::strcmp(e.extensionName, VK_KHR_VIDEO_ENCODE_AV1_EXTENSION_NAME) == 0) out.has_av1 = true;
-                    else if (std::strcmp(e.extensionName, VK_KHR_VIDEO_ENCODE_H265_EXTENSION_NAME) == 0) out.has_hevc = true;
-                    else if (std::strcmp(e.extensionName, VK_KHR_VIDEO_ENCODE_H264_EXTENSION_NAME) == 0) out.has_h264 = true;
+                    if (std::strcmp(e.extensionName, VK_KHR_VIDEO_ENCODE_AV1_EXTENSION_NAME) == 0) out.av1.supported = true;
+                    else if (std::strcmp(e.extensionName, VK_KHR_VIDEO_ENCODE_H265_EXTENSION_NAME) == 0) out.hevc.supported = true;
+                    else if (std::strcmp(e.extensionName, VK_KHR_VIDEO_ENCODE_H264_EXTENSION_NAME) == 0) out.h264.supported = true;
                 }
 
                 auto pfn_get_caps = reinterpret_cast<PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR>(
                     vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceVideoCapabilitiesKHR"));
-                if (pfn_get_caps && (out.has_av1 || out.has_hevc || out.has_h264)) {
-                    auto query_profile = [&](VkVideoComponentBitDepthFlagBitsKHR bd,
-                                             VkVideoCapabilitiesKHR &vcaps,
-                                             VkVideoEncodeCapabilitiesKHR &enc_c) -> bool {
-                        VkVideoProfileInfoKHR prof{};
-                        prof.sType = VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR;
-                        prof.chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR;
-                        prof.lumaBitDepth = bd;
-                        prof.chromaBitDepth = bd;
+                if (pfn_get_caps && out.has_any_codec()) {
+                    auto probe_codec = [&](Codec codec, CodecEncodeCaps &dst) {
+                        if (!dst.supported) return;
+                        auto query_profile = [&](VkVideoComponentBitDepthFlagBitsKHR bd,
+                                                 VkVideoCapabilitiesKHR &vcaps,
+                                                 VkVideoEncodeCapabilitiesKHR &enc_c) -> bool {
+                            VkVideoProfileInfoKHR prof{};
+                            prof.sType = VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR;
+                            prof.chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR;
+                            prof.lumaBitDepth = bd;
+                            prof.chromaBitDepth = bd;
 
-                        VkVideoEncodeAV1ProfileInfoKHR av1_p{VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR, nullptr, STD_VIDEO_AV1_PROFILE_MAIN};
-                        VkVideoEncodeH265ProfileInfoKHR h265_p{VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_PROFILE_INFO_KHR, nullptr,
-                                                               (bd == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
-                                                                   ? STD_VIDEO_H265_PROFILE_IDC_MAIN_10
-                                                                   : STD_VIDEO_H265_PROFILE_IDC_MAIN};
-                        VkVideoEncodeH264ProfileInfoKHR h264_p{VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_PROFILE_INFO_KHR, nullptr, STD_VIDEO_H264_PROFILE_IDC_HIGH};
+                            VkVideoEncodeAV1ProfileInfoKHR av1_p{VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR, nullptr, STD_VIDEO_AV1_PROFILE_MAIN};
+                            VkVideoEncodeH265ProfileInfoKHR h265_p{VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_PROFILE_INFO_KHR, nullptr,
+                                                                   (bd == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
+                                                                       ? STD_VIDEO_H265_PROFILE_IDC_MAIN_10
+                                                                       : STD_VIDEO_H265_PROFILE_IDC_MAIN};
+                            VkVideoEncodeH264ProfileInfoKHR h264_p{VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_PROFILE_INFO_KHR, nullptr, STD_VIDEO_H264_PROFILE_IDC_HIGH};
 
-                        VkVideoEncodeAV1CapabilitiesKHR av1_c{};
-                        av1_c.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_CAPABILITIES_KHR;
-                        VkVideoEncodeH265CapabilitiesKHR h265_c{};
-                        h265_c.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_CAPABILITIES_KHR;
-                        VkVideoEncodeH264CapabilitiesKHR h264_c{};
-                        h264_c.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_CAPABILITIES_KHR;
+                            VkVideoEncodeAV1CapabilitiesKHR av1_c{};
+                            av1_c.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_CAPABILITIES_KHR;
+                            VkVideoEncodeH265CapabilitiesKHR h265_c{};
+                            h265_c.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_CAPABILITIES_KHR;
+                            VkVideoEncodeH264CapabilitiesKHR h264_c{};
+                            h264_c.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_CAPABILITIES_KHR;
 
-                        enc_c = {};
-                        enc_c.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_CAPABILITIES_KHR;
-                        if (out.has_av1) {
-                            prof.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR;
-                            prof.pNext = &av1_p;
-                            enc_c.pNext = &av1_c;
-                        } else if (out.has_hevc) {
-                            prof.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR;
-                            prof.pNext = &h265_p;
-                            enc_c.pNext = &h265_c;
-                        } else {
-                            if (bd == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR) return false;
-                            prof.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR;
-                            prof.pNext = &h264_p;
-                            enc_c.pNext = &h264_c;
+                            enc_c = {};
+                            enc_c.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_CAPABILITIES_KHR;
+                            switch (codec) {
+                                case Codec::Av1:
+                                    prof.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR;
+                                    prof.pNext = &av1_p;
+                                    enc_c.pNext = &av1_c;
+                                    break;
+                                case Codec::Hevc:
+                                    prof.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR;
+                                    prof.pNext = &h265_p;
+                                    enc_c.pNext = &h265_c;
+                                    break;
+                                case Codec::H264:
+                                    if (bd == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR) return false;
+                                    prof.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR;
+                                    prof.pNext = &h264_p;
+                                    enc_c.pNext = &h264_c;
+                                    break;
+                            }
+
+                            vcaps = {};
+                            vcaps.sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR;
+                            vcaps.pNext = &enc_c;
+                            return pfn_get_caps(phys, &prof, &vcaps) == VK_SUCCESS;
+                        };
+
+                        VkVideoCapabilitiesKHR vcaps8{};
+                        VkVideoEncodeCapabilitiesKHR enc_c8{};
+                        if (query_profile(VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR, vcaps8, enc_c8)) {
+                            if (enc_c8.maxQualityLevels > 0) {
+                                dst.max_quality_levels = enc_c8.maxQualityLevels;
+                            }
+                            dst.max_coded_width = vcaps8.maxCodedExtent.width;
+                            dst.max_coded_height = vcaps8.maxCodedExtent.height;
+                            dst.max_hw_bitrate = enc_c8.maxBitrate;
+                            if (enc_c8.rateControlModes != 0) {
+                                dst.supports_vbr = (enc_c8.rateControlModes & VK_VIDEO_ENCODE_RATE_CONTROL_MODE_VBR_BIT_KHR) != 0;
+                                dst.supports_cbr = (enc_c8.rateControlModes & VK_VIDEO_ENCODE_RATE_CONTROL_MODE_CBR_BIT_KHR) != 0;
+                                dst.supports_cqp = (enc_c8.rateControlModes &
+                                    (VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR |
+                                     VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DEFAULT_KHR)) != 0;
+                            }
                         }
 
-                        vcaps = {};
-                        vcaps.sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR;
-                        vcaps.pNext = &enc_c;
-                        return pfn_get_caps(phys, &prof, &vcaps) == VK_SUCCESS;
+                        // Probe actual 10-bit P010 hardware support for this codec
+                        VkVideoCapabilitiesKHR vcaps10{};
+                        VkVideoEncodeCapabilitiesKHR enc_c10{};
+                        dst.supports_10bit = query_profile(VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR, vcaps10, enc_c10);
                     };
 
-                    VkVideoCapabilitiesKHR vcaps8{};
-                    VkVideoEncodeCapabilitiesKHR enc_c8{};
-                    if (query_profile(VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR, vcaps8, enc_c8)) {
-                        if (enc_c8.maxQualityLevels > 0) {
-                            out.max_quality_levels = enc_c8.maxQualityLevels;
-                        }
-                        out.max_coded_width = vcaps8.maxCodedExtent.width;
-                        out.max_coded_height = vcaps8.maxCodedExtent.height;
-                        out.max_hw_bitrate = enc_c8.maxBitrate;
-                        if (enc_c8.rateControlModes != 0) {
-                            out.supports_vbr = (enc_c8.rateControlModes & VK_VIDEO_ENCODE_RATE_CONTROL_MODE_VBR_BIT_KHR) != 0;
-                            out.supports_cbr = (enc_c8.rateControlModes & VK_VIDEO_ENCODE_RATE_CONTROL_MODE_CBR_BIT_KHR) != 0;
-                            out.supports_cqp = (enc_c8.rateControlModes &
-                                (VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR |
-                                 VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DEFAULT_KHR)) != 0;
-                        }
-                    }
-
-                    // Probe actual 10-bit P010 hardware support rather than assuming it
-                    VkVideoCapabilitiesKHR vcaps10{};
-                    VkVideoEncodeCapabilitiesKHR enc_c10{};
-                    out.supports_10bit = query_profile(VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR, vcaps10, enc_c10);
+                    probe_codec(Codec::Av1, out.av1);
+                    probe_codec(Codec::Hevc, out.hevc);
+                    probe_codec(Codec::H264, out.h264);
                 }
             }
         }
@@ -402,10 +417,9 @@ struct VulkanCompute::Impl {
     // 1x1 transparent dummy cursor image so binding 1 is always valid
     CachedSrcImage dummy_cursor{};
 
-    static constexpr size_t kNumSlots = 4;
-    static constexpr size_t kMaxCachedSurfaces = 6;
+    static constexpr size_t kMaxCachedSurfaces = 12;
     static constexpr uint64_t kStaleSurfaceFrames = 180;
-    std::array<CmdSlot, kNumSlots> slots{};
+    std::deque<CmdSlot> slots;
     size_t slot_cursor = 0;
     uint64_t frame_seq = 0;
 
@@ -837,6 +851,9 @@ struct VulkanCompute::Impl {
             }
         }
 
+        const size_t num_slots = std::max<size_t>(cfg.queue_size + 3, 6);
+        slots.clear();
+        for (size_t i = 0; i < num_slots; ++i) slots.emplace_back();
         for (auto &sl : slots) {
             VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr,
                                          VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, compute_qf_idx};
@@ -1153,8 +1170,11 @@ struct VulkanCompute::Impl {
             }
         }
 
-        // Evict least-recently-used tail entry when full
+        // Evict least-recently-used tail entry when full (guard against in-flight async slots)
         if (src_cache.size() >= kMaxCachedSurfaces) {
+            if ((frame_seq - src_cache.back().last_used_frame) <= slots.size()) {
+                pfn_device_wait_idle(compute_dev);
+            }
             destroy_src_image(src_cache.back());
             src_cache.pop_back();
         }
@@ -1359,7 +1379,7 @@ std::expected<void, std::string> VulkanCompute::configure_output(uint32_t width,
     fc->sw_format = (impl_->cfg.pixfmt == PixelFormat::P010) ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
     fc->width = static_cast<int>(width);
     fc->height = static_cast<int>(height);
-    fc->initial_pool_size = static_cast<int>(impl_->cfg.queue_size) + impl_->cfg.async_depth + 4;
+    fc->initial_pool_size = static_cast<int>(impl_->cfg.queue_size) + impl_->cfg.async_depth + 6;
     vkfc->usage = static_cast<VkImageUsageFlagBits>(
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -1410,7 +1430,7 @@ std::expected<void, std::string> VulkanCompute::configure_output(uint32_t width,
     return {};
 }
 
-std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFrame &kf) {
+std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_frame(const KmsFrame &kf) {
     if (!impl_->hw_frames_ref) return std::unexpected("VulkanCompute output not configured");
 
     ++impl_->frame_seq;
@@ -1506,10 +1526,21 @@ std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFram
     }
     VkPipeline pipe = *pipe_res;
 
-    const auto t0 = std::chrono::steady_clock::now();
-
-    CmdSlot &sl = impl_->slots[impl_->slot_cursor];
-    impl_->slot_cursor = (impl_->slot_cursor + 1) % Impl::kNumSlots;
+    const size_t nslots = impl_->slots.size();
+    uint32_t slot_idx = static_cast<uint32_t>(impl_->slot_cursor);
+    for (size_t probe = 0; probe < nslots; ++probe) {
+        const uint32_t cand = static_cast<uint32_t>((impl_->slot_cursor + probe) % nslots);
+        if (!impl_->slots[cand].in_use.load(std::memory_order_acquire)) {
+            slot_idx = cand;
+            break;
+        }
+    }
+    while (impl_->slots[slot_idx].in_use.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    impl_->slot_cursor = (slot_idx + 1) % nslots;
+    CmdSlot &sl = impl_->slots[slot_idx];
+    sl.submit_t0 = std::chrono::steady_clock::now();
 
     impl_->pfn_reset_cp(impl_->compute_dev, sl.pool, 0);
     impl_->pfn_reset_fences(impl_->compute_dev, 1, &sl.fence);
@@ -1702,7 +1733,7 @@ std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFram
         return std::unexpected("vkQueueSubmit2 failed for compute color conversion");
     }
 
-    impl_->pfn_wait_fences(impl_->compute_dev, 1, &sl.fence, VK_TRUE, UINT64_MAX);
+    sl.in_use.store(true, std::memory_order_release);
 
     dst_frame->color_range = (impl_->cfg.color_range == ColorRange::Full) ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
     dst_frame->colorspace = (impl_->cfg.color_space == ColorSpace::Bt2020) ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709;
@@ -1710,13 +1741,27 @@ std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFram
     dst_frame->color_trc = (impl_->cfg.color_space == ColorSpace::Bt2020) ? AVCOL_TRC_BT2020_10 : AVCOL_TRC_BT709;
     dst_frame->chroma_location = AVCHROMA_LOC_LEFT;
 
+    return SubmittedFrame{dst_frame, slot_idx};
+}
+
+void VulkanCompute::wait_slot(uint32_t slot_idx) noexcept {
+    if (!impl_ || slot_idx >= impl_->slots.size()) return;
+    CmdSlot &sl = impl_->slots[slot_idx];
+    if (!sl.in_use.load(std::memory_order_acquire)) return;
+    impl_->pfn_wait_fences(impl_->compute_dev, 1, &sl.fence, VK_TRUE, UINT64_MAX);
     const auto t1 = std::chrono::steady_clock::now();
     impl_->stat_frames_processed.fetch_add(1, std::memory_order_relaxed);
     impl_->stat_total_compute_ns.fetch_add(
-        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - sl.submit_t0).count()),
         std::memory_order_relaxed);
+    sl.in_use.store(false, std::memory_order_release);
+}
 
-    return dst_frame;
+std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFrame &kf) {
+    auto res = submit_frame(kf);
+    if (!res) return std::unexpected(res.error());
+    wait_slot(res->slot_idx);
+    return res->frame;
 }
 
 AVBufferRef *VulkanCompute::hw_device_ref() const noexcept { return impl_->hw_device_ref; }

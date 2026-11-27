@@ -277,40 +277,80 @@ bool prompt_audio_section(std::istream &in, std::ostream &out, Config &cfg, bool
     return true;
 }
 
-bool prompt_resolution_and_output(std::istream &in, std::ostream &out,
-                                  const KmsDisplayInfo &d, Config &cfg) {
-    {
-        std::string ans;
-        while (true) {
-            if (!prompt_line(in, out,
-                             std::format("Output resolution [native {}x{}, or WxH e.g. 1920x1080]: ",
-                                         d.width, d.height),
-                             ans)) {
-                return false;
-            }
-            if (ans.empty() || lower_copy(ans) == "native") {
+bool prompt_resolution(std::istream &in, std::ostream &out,
+                       const KmsDisplayInfo &d,
+                       uint32_t max_coded_w, uint32_t max_coded_h,
+                       Config &cfg) {
+    const auto [clamped_w, clamped_h] = clamp_resolution_to_encoder(d.width, d.height, max_coded_w, max_coded_h);
+    const bool native_exceeds = (clamped_w != d.width || clamped_h != d.height);
+    if (native_exceeds) {
+        out << std::format("   Note: display {}x{} exceeds this codec's encoder limit ({}x{}); defaulting to {}x{}.\n",
+                           d.width, d.height, max_coded_w, max_coded_h, clamped_w, clamped_h);
+    }
+    const std::string prompt = native_exceeds
+        ? std::format("Output resolution [{}x{}, or WxH e.g. 1920x1080]: ", clamped_w, clamped_h)
+        : std::format("Output resolution [native {}x{}, or WxH e.g. 1920x1080]: ", d.width, d.height);
+
+    std::string ans;
+    while (true) {
+        if (!prompt_line(in, out, prompt, ans)) return false;
+        if (ans.empty()) {
+            if (native_exceeds) {
+                cfg.out_width = clamped_w;
+                cfg.out_height = clamped_h;
+            } else {
                 cfg.out_width = 0;
                 cfg.out_height = 0;
-                break;
             }
-            auto res = parse_resolution(ans);
-            if (res) {
-                cfg.out_width = res->first;
-                cfg.out_height = res->second;
-                break;
-            }
-            out << "   " << res.error() << '\n';
+            return true;
         }
+        if (lower_copy(ans) == "native") {
+            if (native_exceeds) {
+                out << std::format("   Native {}x{} exceeds encoder limit ({}x{}). Please choose <= {}x{}.\n",
+                                   d.width, d.height, max_coded_w, max_coded_h, clamped_w, clamped_h);
+                continue;
+            }
+            cfg.out_width = 0;
+            cfg.out_height = 0;
+            return true;
+        }
+        auto res = parse_resolution(ans);
+        if (res) {
+            if ((max_coded_w > 0 && res->first > max_coded_w) ||
+                (max_coded_h > 0 && res->second > max_coded_h)) {
+                out << std::format("   Resolution {}x{} exceeds encoder limit ({}x{}).\n",
+                                   res->first, res->second, max_coded_w, max_coded_h);
+                continue;
+            }
+            cfg.out_width = res->first;
+            cfg.out_height = res->second;
+            return true;
+        }
+        out << "   " << res.error() << '\n';
     }
-    {
-        std::string def_out = cfg.output_path.empty() ? default_output_filename() : cfg.output_path;
-        std::string ans;
+}
+
+bool prompt_output_file(std::istream &in, std::ostream &out, Config &cfg) {
+    const std::string def_out = cfg.output_path.empty() ? default_output_filename() : cfg.output_path;
+    const bool has_audio = cfg.audio && (cfg.capture_system_audio || cfg.capture_mic);
+    std::string ans;
+    while (true) {
         if (!prompt_line(in, out, std::format("Output file (.mkv, .mp4, .webm, .ivf) [{}]: ", def_out), ans)) {
             return false;
         }
-        cfg.output_path = ans.empty() ? def_out : expand_user_path(ans);
+        const std::string chosen = ans.empty() ? def_out : expand_user_path(ans);
+        if (auto compat = check_container_compatibility(chosen, cfg.codec, has_audio, cfg.audio_codec)) {
+            const std::string lo = lower_copy(chosen);
+            const bool hard_error = (lo.ends_with(".webm") || lo.ends_with(".ivf")) && cfg.codec != Codec::Av1;
+            if (hard_error) {
+                out << "   " << *compat << '\n';
+                continue;
+            }
+            out << "   Note: " << *compat << '\n';
+        }
+        cfg.output_path = chosen;
+        return true;
     }
-    return true;
 }
 
 std::string format_equiv_cli(const Config &cfg, const char *prog_name) {
@@ -444,18 +484,10 @@ std::expected<bool, std::string> run_interactive_setup(
     target.display_label = std::format("{} {}x{}@{:.0f}Hz",
                                        sel_disp.connector_name, sel_disp.width, sel_disp.height, sel_disp.refresh_hz);
     if (auto gpu = probe_gpu_encode_support(cfg.device_index, cfg.device_explicit, sel_disp.card_path); gpu.probed) {
-        target.has_av1 = gpu.has_av1;
-        target.has_hevc = gpu.has_hevc;
-        target.has_h264 = gpu.has_h264;
-        target.supports_10bit = gpu.supports_10bit;
-        target.supports_vbr = gpu.supports_vbr;
-        target.supports_cqp = gpu.supports_cqp;
-        target.supports_cbr = gpu.supports_cbr;
-        target.max_quality_levels = gpu.max_quality_levels;
-        target.max_coded_width = gpu.max_coded_width;
-        target.max_coded_height = gpu.max_coded_height;
-        target.max_hw_bitrate = gpu.max_hw_bitrate;
-        target.gpu_name = gpu.device_name;
+        if (!gpu.has_any_codec()) {
+            return std::unexpected(no_encode_support_error(gpu.device_name));
+        }
+        gpu.apply_to(target);
     }
 
     if (mode == 1) {
@@ -492,14 +524,17 @@ std::expected<bool, std::string> run_interactive_setup(
         out << "\nSession options (not set by profile):\n";
         if (!prompt_audio_section(in, out, cfg, false)) return false;
         if (!prompt_yes_no(in, out, "Capture hardware mouse cursor? [Y/n]: ", true, cfg.capture_cursor)) return false;
-        if (!prompt_resolution_and_output(in, out, disps[disp_idx], cfg)) return false;
+        const auto &cc = target.caps_for(cfg.codec);
+        if (!prompt_resolution(in, out, sel_disp, cc.max_coded_width, cc.max_coded_height, cfg)) return false;
+        if (!prompt_output_file(in, out, cfg)) return false;
         // If user chose a scaled resolution in Quick Setup, re-tailor the profile's bitrate to the scaled size
         if (cfg.out_width > 0 && cfg.out_height > 0 && !cfg.profile.empty()) {
             ProfileTarget scaled_target = target;
             scaled_target.width = cfg.out_width;
             scaled_target.height = cfg.out_height;
             Config re{};
-            if (apply_profile(re, cfg.profile, scaled_target).has_value() && re.rc == RateControl::Vbr) {
+            if (apply_profile(re, cfg.profile, scaled_target).has_value() &&
+                (re.rc == RateControl::Vbr || re.rc == RateControl::Cbr)) {
                 cfg.bitrate = re.bitrate;
                 cfg.max_bitrate = re.max_bitrate;
             }
@@ -508,21 +543,42 @@ std::expected<bool, std::string> run_interactive_setup(
         // --- Advanced Setup: Configure every parameter (hardware-aware defaults) ---
         cfg.profile.clear();  // Custom advanced configuration (does not touch any profile)
 
-        const Codec rec_codec = best_codec_for(target);
+        out << "-- GPU & Video Format --\n";
+        int dev_idx = static_cast<int>(cfg.device_index);
+        if (!prompt_int(in, out, "Vulkan GPU device index", dev_idx, 0, 16, dev_idx)) return false;
+        const bool dev_changed = (static_cast<uint32_t>(dev_idx) != cfg.device_index) || (dev_idx != 0 && !cfg.device_explicit);
+        cfg.device_index = static_cast<uint32_t>(dev_idx);
+        cfg.device_explicit = (dev_idx != 0);
+        if (dev_changed) {
+            if (auto gpu = probe_gpu_encode_support(cfg.device_index, cfg.device_explicit, sel_disp.card_path); gpu.probed) {
+                if (!gpu.has_any_codec()) {
+                    return std::unexpected(no_encode_support_error(gpu.device_name));
+                }
+                gpu.apply_to(target);
+            }
+        }
+
+        const Codec rec_codec = best_codec_for(target).value_or(Codec::Av1);
         const size_t def_codec_idx = (rec_codec == Codec::Av1) ? 0 : (rec_codec == Codec::Hevc ? 1 : 2);
-        out << "-- Video Codec & Format --\n";
         if (!prompt_choice<Codec>(in, out, "Video codec:", {
-                {target.has_av1  ? "av1  (supported on this GPU)" : "av1  (not advertised by this GPU)", Codec::Av1},
-                {target.has_hevc ? "hevc (H.265 — supported on this GPU)" : "hevc (H.265 — not advertised)", Codec::Hevc},
-                {target.has_h264 ? "h264 (AVC — supported on this GPU)" : "h264 (AVC — not advertised)", Codec::H264},
+                {target.av1.supported  ? "av1  (supported on this GPU)" : "av1  (not advertised by this GPU)", Codec::Av1},
+                {target.hevc.supported ? "hevc (H.265 — supported on this GPU)" : "hevc (H.265 — not advertised)", Codec::Hevc},
+                {target.h264.supported ? "h264 (AVC — supported on this GPU)" : "h264 (AVC — not advertised)", Codec::H264},
             }, def_codec_idx, cfg.codec)) return false;
         cfg.codec_explicit = true;
 
-        const bool p010_ok = target.supports_10bit && (cfg.codec == Codec::Av1 || cfg.codec == Codec::Hevc);
+        // Use per-codec hardware capabilities for all subsequent defaults and limits
+        const CodecEncodeCaps &cc = target.caps_for(cfg.codec);
+
+        const bool p010_ok = cc.supports_10bit && (cfg.codec == Codec::Av1 || cfg.codec == Codec::Hevc);
         if (!prompt_choice<PixelFormat>(in, out, "Pixel format:", {
                 {"nv12 (8-bit + static IGN dithering)", PixelFormat::Nv12},
                 {p010_ok ? "p010 (10-bit, zero banding)" : "p010 (10-bit — not advertised by this GPU/codec)", PixelFormat::P010},
             }, 0, cfg.pixfmt)) return false;
+
+        if (!prompt_resolution(in, out, sel_disp, cc.max_coded_width, cc.max_coded_height, cfg)) return false;
+        const uint32_t eff_w = cfg.out_width > 0 ? cfg.out_width : sel_disp.width;
+        const uint32_t eff_h = cfg.out_height > 0 ? cfg.out_height : sel_disp.height;
 
         const int def_fps = static_cast<int>(recommended_standard_fps(sel_disp.refresh_hz));
         int fps_val = def_fps;
@@ -547,11 +603,11 @@ std::expected<bool, std::string> run_interactive_setup(
         }
 
         out << "\n-- Rate Control & Encoder Tuning --\n";
-        const size_t def_rc_idx = target.supports_vbr ? 0 : (target.supports_cqp ? 1 : 2);
+        const size_t def_rc_idx = cc.supports_vbr ? 0 : (cc.supports_cqp ? 1 : 2);
         if (!prompt_choice<RateControl>(in, out, "Rate control mode:", {
-                {target.supports_vbr ? "vbr (variable bitrate — recommended, prevents bitrate spikes)" : "vbr (not advertised by this GPU)", RateControl::Vbr},
-                {target.supports_cqp ? "cqp (constant quality — uncapped bitrate, best for archival/desktop)" : "cqp (not advertised by this GPU)", RateControl::Cqp},
-                {target.supports_cbr ? "cbr (constant bitrate)" : "cbr (not advertised by this GPU)", RateControl::Cbr},
+                {cc.supports_vbr ? "vbr (variable bitrate — recommended, prevents bitrate spikes)" : "vbr (not advertised by this GPU)", RateControl::Vbr},
+                {cc.supports_cqp ? "cqp (constant quality — uncapped bitrate, best for archival/desktop)" : "cqp (not advertised by this GPU)", RateControl::Cqp},
+                {cc.supports_cbr ? "cbr (constant bitrate)" : "cbr (not advertised by this GPU)", RateControl::Cbr},
             }, def_rc_idx, cfg.rc)) return false;
 
         if (cfg.rc == RateControl::Cqp) {
@@ -567,7 +623,7 @@ std::expected<bool, std::string> run_interactive_setup(
         } else {
             cfg.qp = -1;
             const int64_t def_br = recommended_bitrate(
-                sel_disp.width, sel_disp.height, cfg.fps, cfg.codec, cfg.pixfmt, 20.0, target.max_hw_bitrate);
+                eff_w, eff_h, cfg.fps, cfg.codec, cfg.pixfmt, 20.0, cc.max_hw_bitrate);
             const std::string def_br_label = std::format("{}M", def_br / 1'000'000);
             std::string ans;
             while (true) {
@@ -592,7 +648,7 @@ std::expected<bool, std::string> run_interactive_setup(
             }
         }
 
-        const int max_q = static_cast<int>(std::max<uint32_t>(1u, target.max_quality_levels)) - 1;
+        const int max_q = static_cast<int>(std::max<uint32_t>(1u, cc.max_quality_levels)) - 1;
         const int def_q = std::min(1, max_q);
         if (!prompt_int(in, out,
                         std::format("Encoder quality level (0..{}, higher = slower)", std::max(max_q, 3)),
@@ -622,12 +678,8 @@ std::expected<bool, std::string> run_interactive_setup(
             }, 0, cfg.content)) return false;
 
         if (!prompt_int(in, out, "Keyframe/IDR interval in frames (0 = auto 2s GOP)", 0, 0, 100000, cfg.idr_interval)) return false;
-        if (!prompt_int(in, out, "GPU async encode depth (1..64, RDNA 4 max safe = 4)", 4, 1, 64, cfg.async_depth)) return false;
-        if (!prompt_int(in, out, "Max B-frame depth (1..8, RDNA 4 AV1 = 1)", 1, 1, 8, cfg.b_depth)) return false;
-        int dev_idx = 0;
-        if (!prompt_int(in, out, "Vulkan GPU device index", 0, 0, 16, dev_idx)) return false;
-        cfg.device_index = static_cast<uint32_t>(dev_idx);
-        cfg.device_explicit = (dev_idx != 0);
+        if (!prompt_int(in, out, "GPU async encode depth (1..64, recommended = 4)", 4, 1, 64, cfg.async_depth)) return false;
+        if (!prompt_int(in, out, "Max B-frame depth (1..8, 1 = no B-frame reordering)", 1, 1, 8, cfg.b_depth)) return false;
         int qsz = 4;
         if (!prompt_int(in, out, "GPU-to-encoder queue depth (1..64)", 4, 1, 64, qsz)) return false;
         cfg.queue_size = static_cast<size_t>(qsz);
@@ -661,7 +713,7 @@ std::expected<bool, std::string> run_interactive_setup(
         if (!prompt_audio_section(in, out, cfg, true)) return false;
 
         out << "\n-- Output --\n";
-        if (!prompt_resolution_and_output(in, out, disps[disp_idx], cfg)) return false;
+        if (!prompt_output_file(in, out, cfg)) return false;
     }
 
     out << "\nSelected configuration:\n"

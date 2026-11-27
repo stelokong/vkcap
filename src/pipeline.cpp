@@ -15,6 +15,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <termios.h>
 #include <thread>
 #include <unistd.h>
@@ -34,44 +35,60 @@ int64_t monotonic_now_ns() {
     return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
 }
 
-void sleep_until_monotonic_ns(int64_t target_ns) {
+void sleep_until_monotonic_ns(int64_t target_ns, const std::atomic<bool> &stop_flag) {
     timespec ts{};
     ts.tv_sec = target_ns / 1'000'000'000LL;
     ts.tv_nsec = target_ns % 1'000'000'000LL;
-    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr) == EINTR) {
+    while (!stop_flag.load(std::memory_order_acquire) &&
+           clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr) == EINTR) {
     }
 }
+
+constexpr uint32_t kNoComputeSlot = UINT32_MAX;
 
 struct EncodedInput {
     AVFrame *frame = nullptr;
     int64_t pts_ticks = 0;
+    uint32_t compute_slot = kNoComputeSlot;
 };
 
 class EncodeFrameQueue {
 public:
-    explicit EncodeFrameQueue(size_t capacity)
-        : capacity_(std::max<size_t>(1, capacity)), ring_(capacity_) {}
+    EncodeFrameQueue(size_t capacity, VulkanCompute *vk)
+        : capacity_(std::max<size_t>(1, capacity)), vk_(vk), ring_(capacity_) {}
 
-    void push(AVFrame *frame, int64_t pts_ticks) {
-        AVFrame *evicted = nullptr;
+    void push(AVFrame *frame, int64_t pts_ticks, uint32_t compute_slot) {
+        EncodedInput evicted{};
+        bool has_evicted = false;
+        bool was_closed = false;
         {
             std::lock_guard lk(mtx_);
             if (closed_) {
-                av_frame_free(&frame);
-                return;
+                evicted = {frame, pts_ticks, compute_slot};
+                has_evicted = true;
+                was_closed = true;
+            } else {
+                if (count_ == capacity_) {
+                    evicted = ring_[head_];
+                    has_evicted = true;
+                    head_ = (head_ + 1) % capacity_;
+                    --count_;
+                    ++dropped_;
+                }
+                ring_[tail_] = {frame, pts_ticks, compute_slot};
+                tail_ = (tail_ + 1) % capacity_;
+                ++count_;
             }
-            if (count_ == capacity_) {
-                evicted = ring_[head_].frame;
-                head_ = (head_ + 1) % capacity_;
-                --count_;
-                ++dropped_;
-            }
-            ring_[tail_] = {frame, pts_ticks};
-            tail_ = (tail_ + 1) % capacity_;
-            ++count_;
         }
-        if (evicted) av_frame_free(&evicted);
-        cv_.notify_one();
+        if (has_evicted) {
+            if (vk_ && evicted.compute_slot != kNoComputeSlot) {
+                vk_->wait_slot(evicted.compute_slot);
+            }
+            av_frame_free(&evicted.frame);
+        }
+        if (!was_closed) {
+            cv_.notify_one();
+        }
     }
 
     bool pop(EncodedInput &out) {
@@ -85,19 +102,24 @@ public:
     }
 
     void close() {
-        std::vector<AVFrame *> leftover;
+        std::vector<EncodedInput> leftover;
         {
             std::lock_guard lk(mtx_);
             closed_ = true;
             leftover.reserve(count_);
             while (count_ > 0) {
-                leftover.push_back(ring_[head_].frame);
+                leftover.push_back(ring_[head_]);
                 head_ = (head_ + 1) % capacity_;
                 --count_;
             }
         }
         cv_.notify_all();
-        for (AVFrame *f : leftover) av_frame_free(&f);
+        for (auto &item : leftover) {
+            if (vk_ && item.compute_slot != kNoComputeSlot) {
+                vk_->wait_slot(item.compute_slot);
+            }
+            av_frame_free(&item.frame);
+        }
     }
 
     uint64_t dropped() const {
@@ -107,6 +129,7 @@ public:
 
 private:
     size_t capacity_;
+    VulkanCompute *vk_ = nullptr;
     mutable std::mutex mtx_;
     std::condition_variable cv_;
     std::vector<EncodedInput> ring_;
@@ -165,11 +188,15 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
 
     // Probe the first KMS frame BEFORE initializing Vulkan so missing CAP_SYS_ADMIN fails
     // instantaneously and exact scanout dimensions are known upfront.
-    auto first_res = kms->grab_frame();
-    if (!first_res) return std::unexpected(first_res.error());
-
-    const uint32_t src_w = first_res->primary.width;
-    const uint32_t src_h = first_res->primary.height;
+    // Release its DMA-BUF FDs immediately after reading dimensions so frame 0 is grabbed fresh at base_ns.
+    uint32_t src_w = 0;
+    uint32_t src_h = 0;
+    {
+        auto probe_res = kms->grab_frame();
+        if (!probe_res) return std::unexpected(probe_res.error());
+        src_w = probe_res->primary.width;
+        src_h = probe_res->primary.height;
+    }
 
     CropRect eff_crop{};
     if (cfg.crop.valid()) {
@@ -185,50 +212,57 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
         if (eff_crop.width < 2 || eff_crop.height < 2) {
             return std::unexpected("Clamped crop region must be at least 2x2 pixels");
         }
-        first_res->crop = eff_crop;
     }
 
     const uint32_t active_w = eff_crop.valid() ? static_cast<uint32_t>(eff_crop.width) : src_w;
     const uint32_t active_h = eff_crop.valid() ? static_cast<uint32_t>(eff_crop.height) : src_h;
-    const uint32_t enc_w = cfg.out_width ? cfg.out_width : (active_w & ~1u);
-    const uint32_t enc_h = cfg.out_height ? cfg.out_height : (active_h & ~1u);
+    uint32_t enc_w = cfg.out_width ? cfg.out_width : (active_w & ~1u);
+    uint32_t enc_h = cfg.out_height ? cfg.out_height : (active_h & ~1u);
+
+    // Probe target GPU Vulkan Video encode capabilities; fail early if the GPU has no encode extensions.
+    ProfileTarget target{};
+    target.width = enc_w;
+    target.height = enc_h;
+    target.refresh_hz = disp.refresh_hz;
+    const auto gpu = probe_gpu_encode_support(cfg.device_index, cfg.device_explicit, disp.card_path);
+    if (gpu.probed) {
+        if (!gpu.has_any_codec()) {
+            return std::unexpected(no_encode_support_error(gpu.device_name));
+        }
+        gpu.apply_to(target);
+    }
+
+    // Clamp or reject resolutions exceeding the selected codec's hardware maxCodedExtent.
+    const Codec planned_codec = cfg.codec_explicit ? cfg.codec
+        : best_codec_for(target).value_or(cfg.codec);
+    const auto &planned_caps = target.caps_for(planned_codec);
+    if (gpu.probed &&
+        ((planned_caps.max_coded_width > 0 && enc_w > planned_caps.max_coded_width) ||
+         (planned_caps.max_coded_height > 0 && enc_h > planned_caps.max_coded_height))) {
+        auto [clamped_w, clamped_h] = clamp_resolution_to_encoder(
+            enc_w, enc_h, planned_caps.max_coded_width, planned_caps.max_coded_height);
+        if (cfg.out_width > 0 || cfg.out_height > 0) {
+            return std::unexpected(std::format(
+                "Requested output resolution {}x{} exceeds GPU encoder max coded extent {}x{} "
+                "(try -s {}x{}).",
+                enc_w, enc_h, planned_caps.max_coded_width, planned_caps.max_coded_height,
+                clamped_w, clamped_h));
+        }
+        std::cerr << std::format(
+            "[vkcap] Note: display {}x{} exceeds GPU encoder limit ({}x{}); scaling output to {}x{}.\n",
+            enc_w, enc_h, planned_caps.max_coded_width, planned_caps.max_coded_height,
+            clamped_w, clamped_h);
+        enc_w = clamped_w;
+        enc_h = clamped_h;
+        target.width = enc_w;
+        target.height = enc_h;
+    }
 
     // Tailor non-explicit profile parameters (codec, bitrate, FPS, QP, bit depth) to the
     // actual output resolution, display refresh rate, and GPU Vulkan Video capabilities.
     if (!cfg.from_saved_defaults) {
-        ProfileTarget target{};
-        target.width = enc_w;
-        target.height = enc_h;
-        target.refresh_hz = disp.refresh_hz;
-        if (auto gpu = probe_gpu_encode_support(cfg.device_index, cfg.device_explicit, disp.card_path); gpu.probed) {
-            target.has_av1 = gpu.has_av1;
-            target.has_hevc = gpu.has_hevc;
-            target.has_h264 = gpu.has_h264;
-            target.supports_10bit = gpu.supports_10bit;
-            target.supports_vbr = gpu.supports_vbr;
-            target.supports_cqp = gpu.supports_cqp;
-            target.supports_cbr = gpu.supports_cbr;
-            target.max_quality_levels = gpu.max_quality_levels;
-            target.max_coded_width = gpu.max_coded_width;
-            target.max_coded_height = gpu.max_coded_height;
-            target.max_hw_bitrate = gpu.max_hw_bitrate;
-        }
-        Config adapted{};
-        if (apply_profile(adapted, cfg.profile.empty() ? "default" : cfg.profile, target).has_value()) {
-            if (!cfg.fps_explicit) cfg.fps = adapted.fps;
-            if (!cfg.codec_explicit) cfg.codec = adapted.codec;
-            if (!cfg.pixfmt_explicit) cfg.pixfmt = adapted.pixfmt;
-            if (!cfg.quality_explicit) cfg.quality = adapted.quality;
-            if (!cfg.rc_explicit && !cfg.qp_explicit && !cfg.bitrate_explicit) {
-                cfg.rc = adapted.rc;
-                cfg.qp = adapted.qp;
-                cfg.bitrate = adapted.bitrate;
-                if (!cfg.max_bitrate_explicit) cfg.max_bitrate = adapted.max_bitrate;
-            } else if (!cfg.bitrate_explicit && (cfg.rc == RateControl::Vbr || cfg.rc == RateControl::Cbr)) {
-                cfg.bitrate = adapted.bitrate;
-                if (!cfg.max_bitrate_explicit) cfg.max_bitrate = adapted.max_bitrate;
-            }
-        }
+        auto adapt_res = adapt_config_to_target(cfg, target);
+        if (!adapt_res) return std::unexpected(adapt_res.error());
     }
 
     auto vk_res = VulkanCompute::create(cfg, gamut.enabled, gamut.matrix, disp.card_path);
@@ -318,7 +352,7 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
             gamut.description, audio_desc);
     }
 
-    EncodeFrameQueue encode_queue(cfg.queue_size);
+    EncodeFrameQueue encode_queue(cfg.queue_size, vk.get());
     std::mutex err_mtx;
     std::string async_err;
 
@@ -331,12 +365,16 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
     const auto start_wall = std::chrono::steady_clock::now();
     auto last_report = start_wall;
     uint64_t last_enc_frames = 0;
+    std::atomic<int64_t> pause_offset_ns{0};
 
     // Stage 2: Dedicated Vulkan Video Encode thread (av1_vulkan on VCN)
     std::jthread encode_thread([&](std::stop_token) {
         pthread_setname_np(pthread_self(), "vkcap-enc");
         EncodedInput item{};
         while (encode_queue.pop(item)) {
+            if (item.compute_slot != kNoComputeSlot) {
+                vk->wait_slot(item.compute_slot);
+            }
             auto enc_err = encoder->encode_frame(item.frame, item.pts_ticks);
             av_frame_free(&item.frame);
             if (!enc_err) {
@@ -350,7 +388,9 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
                 auto est = encoder->stats();
                 auto cst = vk->stats();
                 double inst_fps = static_cast<double>(est.frames_submitted - last_enc_frames) / dt;
-                double elapsed_total = std::chrono::duration<double>(now - start_wall).count();
+                double pause_sec = static_cast<double>(pause_offset_ns.load(std::memory_order_relaxed)) / 1e9;
+                double elapsed_total = std::max(
+                    0.0, std::chrono::duration<double>(now - start_wall).count() - pause_sec);
                 double mbps = elapsed_total > 0.0
                     ? (static_cast<double>(est.bytes_written) * 8.0 / 1'000'000.0) / elapsed_total
                     : 0.0;
@@ -385,43 +425,64 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
         }
     });
 
-    // Stage 1: Precision clock-paced KMS grab + isolated low-priority GPU compute
+    // Stage 1: Precision clock-paced KMS grab (with optional non-blocking vblank phase-lock)
     pthread_setname_np(pthread_self(), "vkcap");
     ::prctl(PR_SET_TIMERSLACK, 1, 0, 0, 0);
-    const int64_t frame_interval_ns = 1'000'000'000LL / std::max<uint32_t>(1u, cfg.fps);
-    int64_t base_ns = monotonic_now_ns();
-    std::atomic<int64_t> pause_offset_ns{0};
+    // Modest priority boost for capture timer thread so heavy 100%-CPU games don't jitter wakeups
+    (void)::setpriority(PRIO_PROCESS, static_cast<id_t>(::gettid()), -5);
+
+    const int64_t base_ns = monotonic_now_ns();
+    FramePacer pacer(base_ns, cfg.fps, disp.refresh_hz);
+    std::atomic<bool> pause_updating{false};
     int64_t frame_idx = 0;
 
-    // Stage 1b: Wall-clock mastered Opus audio encoder thread (locked to exact same base_ns)
+    if (pacer.vblank_lock_eligible()) {
+        if (auto vb = kms->query_vblank_ns()) {
+            pacer.observe_vblank(*vb, 1, base_ns, 0);
+        }
+    }
+
+    // Stage 1b: Wall-clock mastered audio encoder thread (locked to immutable base_ns)
+    // Reads with a ~42.7 ms wall-clock cushion matching AdaptiveAudioBuffer::kDefaultTargetCushion
+    // so 256/512/960/1024/2048-frame PipeWire quanta are always ready at pts=0 (exact 0 ms A/V sync).
     std::atomic<bool> audio_stop{false};
     std::jthread audio_thread;
     if (audio) {
         audio->reset_sync();
         const int a_frame_sz = encoder->audio_frame_size();
         const uint32_t a_rate = audio->sample_rate();
-        audio_thread = std::jthread([&, base_ns, a_frame_sz, a_rate](std::stop_token) {
+        const int64_t audio_cushion_ns =
+            (static_cast<int64_t>(AdaptiveAudioBuffer::kDefaultTargetCushion) * 1'000'000'000LL) /
+            static_cast<int64_t>(a_rate);
+        audio_thread = std::jthread([&, base_ns, a_frame_sz, a_rate, audio_cushion_ns](std::stop_token) {
             pthread_setname_np(pthread_self(), "vkcap-aenc");
             ::prctl(PR_SET_TIMERSLACK, 1, 0, 0, 0);
+            (void)::setpriority(PRIO_PROCESS, static_cast<id_t>(::gettid()), -5);
             std::vector<float> pcm(static_cast<size_t>(a_frame_sz) * 2);
             int64_t a_idx = 0;
             while (!audio_stop.load(std::memory_order_acquire) &&
                    !stop_flag.load(std::memory_order_acquire)) {
-                if (signals.paused.load(std::memory_order_acquire)) {
-                    sleep_until_monotonic_ns(monotonic_now_ns() + 20'000'000LL);
+                if (signals.paused.load(std::memory_order_acquire) ||
+                    pause_updating.load(std::memory_order_acquire)) {
+                    // Wait until unpaused AND main loop finishes updating pause_offset_ns + audio sync
+                    sleep_until_monotonic_ns(monotonic_now_ns() + 10'000'000LL, stop_flag);
                     continue;
                 }
+                const int64_t total_samples = (a_idx + 1) * static_cast<int64_t>(a_frame_sz);
+                const int64_t rate64 = static_cast<int64_t>(a_rate);
+                const int64_t sample_end_ns = (total_samples / rate64) * 1'000'000'000LL +
+                                              ((total_samples % rate64) * 1'000'000'000LL) / rate64;
                 const int64_t target_ns = base_ns + pause_offset_ns.load(std::memory_order_acquire) +
-                    ((a_idx + 1) * static_cast<int64_t>(a_frame_sz) * 1'000'000'000LL) /
-                    static_cast<int64_t>(a_rate);
+                    sample_end_ns + audio_cushion_ns;
                 if (monotonic_now_ns() < target_ns) {
-                    sleep_until_monotonic_ns(target_ns);
+                    sleep_until_monotonic_ns(target_ns, stop_flag);
                 }
                 if (audio_stop.load(std::memory_order_acquire) ||
                     stop_flag.load(std::memory_order_acquire)) {
                     break;
                 }
-                if (signals.paused.load(std::memory_order_acquire)) {
+                if (signals.paused.load(std::memory_order_acquire) ||
+                    pause_updating.load(std::memory_order_acquire)) {
                     continue;
                 }
                 audio->read_mixed_frames(pcm.data(), static_cast<size_t>(a_frame_sz));
@@ -436,13 +497,42 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
         });
     }
 
-    // Submit the already-grabbed first frame immediately
-    {
-        auto gpu_res = vk->process_frame(*first_res);
-        if (!gpu_res) {
-            record_err(gpu_res.error());
-        } else {
-            encode_queue.push(*gpu_res, frame_idx++);
+    // Grab and submit a fresh frame 0 right at base_ns (never a stale pre-Vulkan probe frame)
+    AVFrame *last_submitted_frame = nullptr;
+    auto update_last_frame = [&](AVFrame *src_frame) {
+        if (last_submitted_frame) av_frame_free(&last_submitted_frame);
+        last_submitted_frame = av_frame_clone(src_frame);
+    };
+    auto apply_clamped_crop = [&](KmsFrame &kf) {
+        if (!eff_crop.valid()) return;
+        const int32_t pw = static_cast<int32_t>(kf.primary.width);
+        const int32_t ph = static_cast<int32_t>(kf.primary.height);
+        if (eff_crop.x < pw && eff_crop.y < ph) {
+            CropRect c{};
+            c.x = eff_crop.x;
+            c.y = eff_crop.y;
+            c.width = std::min(eff_crop.width, pw - c.x);
+            c.height = std::min(eff_crop.height, ph - c.y);
+            if (c.width >= 2 && c.height >= 2) kf.crop = c;
+        }
+    };
+
+    uint32_t last_src_w = src_w;
+    uint32_t last_src_h = src_h;
+
+    if (!stop_flag.load(std::memory_order_acquire)) {
+        bool unused_dup = false;
+        const uint64_t vb0_seq = kms->query_vblank().transform([](auto v) { return v.sequence; }).value_or(0);
+        auto frame0_res = kms->grab_frame_dedup(vb0_seq, unused_dup);
+        if (frame0_res) {
+            apply_clamped_crop(*frame0_res);
+            auto gpu_res = vk->submit_frame(*frame0_res);
+            if (!gpu_res) {
+                record_err(gpu_res.error());
+            } else {
+                update_last_frame(gpu_res->frame);
+                encode_queue.push(gpu_res->frame, frame_idx++, gpu_res->slot_idx);
+            }
         }
     }
 
@@ -450,6 +540,13 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
     const int64_t end_ns = (cfg.duration_sec > 0.0)
         ? (base_ns + static_cast<int64_t>(cfg.duration_sec * 1e9))
         : 0;
+
+    uint64_t stall_skips = 0;
+    uint64_t kms_misses = 0;
+    uint64_t dup_reused = 0;
+    int64_t max_wake_jitter_ns = 0;
+    int64_t sum_wake_jitter_ns = 0;
+    uint64_t wake_samples = 0;
 
     while (!stop_flag.load(std::memory_order_acquire)) {
         // Check non-blocking terminal keypresses in instant-replay mode (~6 Hz, zero overhead)
@@ -478,54 +575,104 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
 
         // Handle SIGUSR1 pause/resume cleanly while preserving continuous A/V timestamps
         if (signals.paused.load(std::memory_order_acquire)) {
+            pause_updating.store(true, std::memory_order_release);
             const int64_t p_start = monotonic_now_ns();
             std::cerr << "\n[vkcap] Paused (send SIGUSR1 to resume)...\n" << std::flush;
             while (signals.paused.load(std::memory_order_acquire) &&
                    !stop_flag.load(std::memory_order_acquire)) {
-                sleep_until_monotonic_ns(monotonic_now_ns() + 50'000'000LL);
+                sleep_until_monotonic_ns(monotonic_now_ns() + 15'000'000LL, stop_flag);
             }
-            if (stop_flag.load(std::memory_order_acquire)) break;
+            if (stop_flag.load(std::memory_order_acquire)) {
+                pause_updating.store(false, std::memory_order_release);
+                break;
+            }
             const int64_t p_dur = monotonic_now_ns() - p_start;
             pause_offset_ns.fetch_add(p_dur, std::memory_order_release);
+            if (last_submitted_frame) av_frame_free(&last_submitted_frame);
             if (audio) audio->reset_sync();
+            pacer.on_resume();
+            // Release audio thread only after pause_offset_ns and audio->reset_sync() are committed
+            pause_updating.store(false, std::memory_order_release);
             std::cerr << "[vkcap] Resumed.\n" << std::flush;
             continue;
         }
 
         const int64_t p_off = pause_offset_ns.load(std::memory_order_relaxed);
-        int64_t target_ns = base_ns + p_off + (frame_idx * 1'000'000'000LL) / static_cast<int64_t>(cfg.fps);
         int64_t now_ns = monotonic_now_ns();
         if (end_ns > 0 && now_ns >= (end_ns + p_off)) {
             break;
         }
+        const int64_t target_ns = pacer.next_target_ns(frame_idx, p_off);
         if (now_ns < target_ns) {
-            sleep_until_monotonic_ns(target_ns);
-        } else if (now_ns - target_ns > frame_interval_ns * 2) {
-            base_ns = now_ns - p_off - (frame_idx * 1'000'000'000LL) / static_cast<int64_t>(cfg.fps);
+            sleep_until_monotonic_ns(target_ns, stop_flag);
+            const int64_t wake_ns = monotonic_now_ns();
+            const int64_t late_ns = std::max<int64_t>(0, wake_ns - target_ns);
+            max_wake_jitter_ns = std::max(max_wake_jitter_ns, late_ns);
+            sum_wake_jitter_ns += late_ns;
+            ++wake_samples;
+            now_ns = wake_ns;
+        } else {
+            // Stall recovery: advance frame_idx to wall-clock tick without shifting base_ns
+            const int64_t prev_idx = frame_idx;
+            if (pacer.recover_if_stalled(frame_idx, now_ns, p_off)) {
+                stall_skips += static_cast<uint64_t>(frame_idx - prev_idx);
+            }
         }
 
         if (stop_flag.load(std::memory_order_acquire)) break;
 
-        auto frame_res = kms->grab_frame();
+        uint64_t cur_vb_seq = 0;
+        if (auto vb = kms->query_vblank()) {
+            cur_vb_seq = vb->sequence;
+            if (pacer.vblank_lock_eligible()) {
+                pacer.observe_vblank(vb->ns, frame_idx, now_ns, p_off);
+            }
+        }
+
+        bool unchanged = false;
+        auto frame_res = kms->grab_frame_dedup(cur_vb_seq, unchanged);
         if (!frame_res) {
-            // Brief transient miss during mode-set / fullscreen transition: skip tick cleanly
+            // Brief transient miss during mode-set / fullscreen transition: refresh mode Hz & skip tick
             if (cfg.verbose) {
                 std::cerr << "\n[kms] transient grab miss: " << frame_res.error() << '\n';
             }
+            if (auto hz = kms->query_refresh_hz()) {
+                pacer.update_refresh_hz(*hz);
+            }
+            ++kms_misses;
             frame_idx++;
             continue;
         }
-        if (eff_crop.valid()) {
-            frame_res->crop = eff_crop;
+
+        if (unchanged && last_submitted_frame) {
+            // Zero-compute duplicate-frame reuse: display did not flip & cursor did not move
+            if (AVFrame *dup = av_frame_clone(last_submitted_frame)) {
+                ++dup_reused;
+                encode_queue.push(dup, frame_idx++, kNoComputeSlot);
+                continue;
+            }
         }
 
-        auto gpu_res = vk->process_frame(*frame_res);
+        // Detect mid-recording fullscreen modeset / resolution change and adapt pacer refresh rate
+        if (frame_res->primary.width != last_src_w || frame_res->primary.height != last_src_h) {
+            last_src_w = frame_res->primary.width;
+            last_src_h = frame_res->primary.height;
+            if (auto hz = kms->query_refresh_hz()) {
+                pacer.update_refresh_hz(*hz);
+            }
+        }
+        apply_clamped_crop(*frame_res);
+
+        auto gpu_res = vk->submit_frame(*frame_res);
         if (!gpu_res) {
             record_err(gpu_res.error());
             break;
         }
-        encode_queue.push(*gpu_res, frame_idx++);
+        update_last_frame(gpu_res->frame);
+        encode_queue.push(gpu_res->frame, frame_idx++, gpu_res->slot_idx);
     }
+
+    if (last_submitted_frame) av_frame_free(&last_submitted_frame);
 
     audio_stop.store(true, std::memory_order_release);
     if (audio_thread.joinable()) audio_thread.join();
@@ -538,12 +685,15 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
 
     auto est = encoder->stats();
     auto cst = vk->stats();
-    double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - start_wall).count();
-    double avg_fps = elapsed > 0.0 ? static_cast<double>(est.frames_submitted) / elapsed : 0.0;
-    double avg_comp_ms = cst.frames_processed > 0
+    const double pause_sec = static_cast<double>(pause_offset_ns.load(std::memory_order_relaxed)) / 1e9;
+    const double elapsed = std::max(
+        0.0,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start_wall).count() - pause_sec);
+    const double avg_fps = elapsed > 0.0 ? static_cast<double>(est.frames_submitted) / elapsed : 0.0;
+    const double avg_comp_ms = cst.frames_processed > 0
         ? (static_cast<double>(cst.total_compute_ns) / static_cast<double>(cst.frames_processed)) / 1e6
         : 0.0;
+    const uint64_t total_dropped = encode_queue.dropped() + stall_skips + kms_misses;
     if (encoder->replay_mode()) {
         auto rst = encoder->replay_stats();
         std::cerr << std::format(
@@ -552,8 +702,24 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
     } else {
         std::cerr << std::format(
             "[vkcap] Saved '{}' ({} frames, {:.1f}s, {:.1f} avg fps, {} dropped, {:.2f} MiB, compute {:.2f} ms/f)\n",
-            cfg.output_path, est.frames_submitted, elapsed, avg_fps, encode_queue.dropped(),
+            cfg.output_path, est.frames_submitted, elapsed, avg_fps, total_dropped,
             static_cast<double>(est.bytes_written) / (1024.0 * 1024.0), avg_comp_ms);
+    }
+    if (cfg.verbose) {
+        const double avg_jitter_us = wake_samples > 0
+            ? (static_cast<double>(sum_wake_jitter_ns) / static_cast<double>(wake_samples)) / 1000.0
+            : 0.0;
+        const double max_jitter_us = static_cast<double>(max_wake_jitter_ns) / 1000.0;
+        std::cerr << std::format(
+            "[pacing] wake jitter avg {:.1f} us / max {:.1f} us | dup_reused={} stall_skips={} kms_misses={} q_drops={} vb_wraps={} (1/{})\n",
+            avg_jitter_us, max_jitter_us, dup_reused, stall_skips, kms_misses,
+            encode_queue.dropped(), pacer.vblank_wraps(), pacer.vblank_denominator());
+        if (audio) {
+            const auto ast = audio->stats();
+            std::cerr << std::format(
+                "[audio] sync skew={:+} ppm | underruns={} overrun_trims={}\n",
+                ast.ratio_ppm, ast.underruns, ast.overrun_trims);
+        }
     }
 
     std::lock_guard lk(err_mtx);

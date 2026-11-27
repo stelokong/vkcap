@@ -18,78 +18,6 @@ namespace vkcap {
 
 namespace {
 
-// Lock-free Single-Producer Single-Consumer ring buffer for interleaved stereo float32 frames.
-// Producer: PipeWire real-time audio callback (zero locks, zero allocations).
-// Consumer: vkcap-aenc encoder thread.
-class StereoRingBuffer {
-public:
-    static constexpr size_t kCapFrames = 65536;  // ~1.36s @ 48 kHz (power of two)
-    static constexpr size_t kMask = kCapFrames - 1;
-
-    void reset() noexcept {
-        const uint64_t w = write_pos_.load(std::memory_order_acquire);
-        read_pos_.store(w, std::memory_order_release);
-    }
-
-    size_t available_frames() const noexcept {
-        const uint64_t w = write_pos_.load(std::memory_order_acquire);
-        const uint64_t r = read_pos_.load(std::memory_order_relaxed);
-        return (w >= r) ? static_cast<size_t>(w - r) : 0;
-    }
-
-    // Called from PipeWire RT callback
-    void push_frames(const float *interleaved, size_t nframes) noexcept {
-        if (nframes == 0) return;
-        const uint64_t w = write_pos_.load(std::memory_order_relaxed);
-        const uint64_t r = read_pos_.load(std::memory_order_acquire);
-        const uint64_t used = (w >= r) ? (w - r) : 0;
-        const size_t free_space = (used < kCapFrames) ? static_cast<size_t>(kCapFrames - used) : 0;
-        const size_t to_write = std::min(nframes, free_space);
-        if (to_write == 0) return;
-
-        const size_t idx = static_cast<size_t>(w & kMask);
-        const size_t first = std::min(to_write, kCapFrames - idx);
-        std::memcpy(&buf_[idx * 2], interleaved, first * 2 * sizeof(float));
-        if (to_write > first) {
-            std::memcpy(&buf_[0], interleaved + first * 2, (to_write - first) * 2 * sizeof(float));
-        }
-        write_pos_.store(w + to_write, std::memory_order_release);
-    }
-
-    // Called from audio encoder thread: reads up to nframes, zero-fills remainder,
-    // and trims excessive backlog (> max_backlog_frames) to keep A/V latency tight.
-    void pop_frames(float *dst, size_t nframes, size_t max_backlog_frames) noexcept {
-        uint64_t r = read_pos_.load(std::memory_order_relaxed);
-        const uint64_t w = write_pos_.load(std::memory_order_acquire);
-        uint64_t avail = (w >= r) ? (w - r) : 0;
-
-        if (avail > max_backlog_frames) {
-            const uint64_t skip = avail - max_backlog_frames;
-            r += skip;
-            avail -= skip;
-        }
-
-        const size_t to_read = std::min<size_t>(nframes, static_cast<size_t>(avail));
-        if (to_read > 0) {
-            const size_t idx = static_cast<size_t>(r & kMask);
-            const size_t first = std::min(to_read, kCapFrames - idx);
-            std::memcpy(dst, &buf_[idx * 2], first * 2 * sizeof(float));
-            if (to_read > first) {
-                std::memcpy(dst + first * 2, &buf_[0], (to_read - first) * 2 * sizeof(float));
-            }
-            read_pos_.store(r + to_read, std::memory_order_release);
-        }
-        if (to_read < nframes) {
-            std::memset(dst + to_read * 2, 0, (nframes - to_read) * 2 * sizeof(float));
-        }
-    }
-
-private:
-    std::array<float, kCapFrames * 2> buf_{};
-    alignas(64) std::atomic<uint64_t> write_pos_{0};
-    alignas(64) std::atomic<uint64_t> read_pos_{0};
-};
-
 void ensure_pw_init() {
     static std::once_flag once;
     std::call_once(once, [] { pw_init(nullptr, nullptr); });
@@ -152,7 +80,7 @@ void on_core_done(void *data, uint32_t id, int seq) {
 struct CaptureStream {
     pw_stream *stream = nullptr;
     spa_hook listener{};
-    StereoRingBuffer ring;
+    AdaptiveAudioBuffer ring;
     uint32_t channels = 2;
 };
 
@@ -464,28 +392,26 @@ void AudioCapture::reset_sync() noexcept {
 }
 
 void AudioCapture::read_mixed_frames(float *dst, size_t nb_frames) noexcept {
-    // Allow up to ~80 ms backlog (4 Opus frames) before trimming drift
-    constexpr size_t kMaxBacklog = 960 * 4;
     const size_t nsamples = nb_frames * 2;
     const float sg = impl_->cfg.system_gain;
     const float mg = impl_->cfg.mic_gain;
 
     if (impl_->sys_stream && impl_->mic_stream) {
-        impl_->sys_stream->ring.pop_frames(dst, nb_frames, kMaxBacklog);
+        impl_->sys_stream->ring.pop_resampled(dst, nb_frames);
         if (impl_->tmp_mic.size() < nsamples) impl_->tmp_mic.resize(nsamples);
-        impl_->mic_stream->ring.pop_frames(impl_->tmp_mic.data(), nb_frames, kMaxBacklog);
+        impl_->mic_stream->ring.pop_resampled(impl_->tmp_mic.data(), nb_frames);
         for (size_t i = 0; i < nsamples; ++i) {
             dst[i] = soft_limit(dst[i] * sg + impl_->tmp_mic[i] * mg);
         }
     } else if (impl_->sys_stream) {
-        impl_->sys_stream->ring.pop_frames(dst, nb_frames, kMaxBacklog);
+        impl_->sys_stream->ring.pop_resampled(dst, nb_frames);
         if (std::abs(sg - 1.0f) > 1e-4f) {
             for (size_t i = 0; i < nsamples; ++i) {
                 dst[i] = soft_limit(dst[i] * sg);
             }
         }
     } else if (impl_->mic_stream) {
-        impl_->mic_stream->ring.pop_frames(dst, nb_frames, kMaxBacklog);
+        impl_->mic_stream->ring.pop_resampled(dst, nb_frames);
         if (std::abs(mg - 1.0f) > 1e-4f) {
             for (size_t i = 0; i < nsamples; ++i) {
                 dst[i] = soft_limit(dst[i] * mg);
@@ -498,5 +424,22 @@ void AudioCapture::read_mixed_frames(float *dst, size_t nb_frames) noexcept {
 
 uint32_t AudioCapture::sample_rate() const noexcept { return impl_->cfg.sample_rate; }
 uint32_t AudioCapture::channels() const noexcept { return impl_->cfg.channels; }
+
+AudioSyncStats AudioCapture::stats() const noexcept {
+    AudioSyncStats out{};
+    if (impl_->sys_stream) {
+        auto s = impl_->sys_stream->ring.stats();
+        out.underruns += s.underruns;
+        out.overrun_trims += s.overrun_trims;
+        out.ratio_ppm = s.ratio_ppm;
+    }
+    if (impl_->mic_stream) {
+        auto m = impl_->mic_stream->ring.stats();
+        out.underruns += m.underruns;
+        out.overrun_trims += m.overrun_trims;
+        if (!impl_->sys_stream) out.ratio_ppm = m.ratio_ppm;
+    }
+    return out;
+}
 
 }  // namespace vkcap

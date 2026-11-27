@@ -681,20 +681,25 @@ std::expected<std::unique_ptr<VideoEncoder>, std::string> VideoEncoder::open(
     // Probe GPU Vulkan Video encode extensions & quality levels for cross-vendor / older-GPU compatibility
     Codec chosen_codec = cfg.codec;
     VkEncodeCaps vcaps = probe_vk_encode_caps(hw_device_ref, chosen_codec, cfg.pixfmt);
-    if (vcaps.probed && !cfg.codec_explicit) {
-        auto codec_supported = [&](Codec c) {
-            if (c == Codec::Av1) return vcaps.has_av1;
-            if (c == Codec::Hevc) return vcaps.has_hevc;
-            return vcaps.has_h264;
-        };
-        if (!codec_supported(chosen_codec)) {
-            if (vcaps.has_hevc) chosen_codec = Codec::Hevc;
-            else if (vcaps.has_h264) chosen_codec = Codec::H264;
-            if (chosen_codec != cfg.codec) {
-                std::cerr << std::format(
-                    "[vkcap] GPU does not advertise {}; auto-falling back to {}\n",
-                    codec_name(cfg.codec), codec_name(chosen_codec));
-                vcaps = probe_vk_encode_caps(hw_device_ref, chosen_codec, cfg.pixfmt);
+    if (vcaps.probed) {
+        if (!vcaps.has_av1 && !vcaps.has_hevc && !vcaps.has_h264) {
+            return std::unexpected(no_encode_support_error());
+        }
+        if (!cfg.codec_explicit) {
+            auto codec_supported = [&](Codec c) {
+                if (c == Codec::Av1) return vcaps.has_av1;
+                if (c == Codec::Hevc) return vcaps.has_hevc;
+                return vcaps.has_h264;
+            };
+            if (!codec_supported(chosen_codec)) {
+                if (vcaps.has_hevc) chosen_codec = Codec::Hevc;
+                else if (vcaps.has_h264) chosen_codec = Codec::H264;
+                if (chosen_codec != cfg.codec) {
+                    std::cerr << std::format(
+                        "[vkcap] GPU does not advertise {}; auto-falling back to {}\n",
+                        codec_name(cfg.codec), codec_name(chosen_codec));
+                    vcaps = probe_vk_encode_caps(hw_device_ref, chosen_codec, cfg.pixfmt);
+                }
             }
         }
     }
@@ -1096,6 +1101,8 @@ std::expected<std::string, std::string> VideoEncoder::save_replay_async(std::str
         const int64_t v_base_pts = impl_->replay_v_pkts[first_kf]->pts;
         const int64_t v_base_dts = (impl_->replay_v_pkts[first_kf]->dts != AV_NOPTS_VALUE)
             ? impl_->replay_v_pkts[first_kf]->dts : v_base_pts;
+        // Shift both PTS and DTS by the same origin to preserve exact CTS (pts - dts) with B-frames
+        const int64_t v_origin = std::min(v_base_pts, v_base_dts);
         const int64_t v_last_pts = impl_->replay_v_pkts.back()->pts;
         job.duration_sec = static_cast<double>(std::max<int64_t>(0, v_last_pts - v_base_pts + 1)) *
                            av_q2d(impl_->enc_ctx->time_base);
@@ -1109,13 +1116,13 @@ std::expected<std::string, std::string> VideoEncoder::save_replay_async(std::str
                 Impl::free_save_job(job);
                 return std::unexpected("av_packet_ref(video) failed");
             }
-            if (ref->pts != AV_NOPTS_VALUE) ref->pts -= v_base_pts;
-            if (ref->dts != AV_NOPTS_VALUE) ref->dts -= v_base_dts;
+            if (ref->pts != AV_NOPTS_VALUE) ref->pts -= v_origin;
+            if (ref->dts != AV_NOPTS_VALUE) ref->dts -= v_origin;
             job.v_pkts.push_back(ref);
         }
 
         if (impl_->audio_enc_ctx && !impl_->replay_a_pkts.empty()) {
-            const int64_t a_start_pts = av_rescale_q(v_base_pts, impl_->enc_ctx->time_base,
+            const int64_t a_start_pts = av_rescale_q(v_origin, impl_->enc_ctx->time_base,
                                                      impl_->audio_enc_ctx->time_base);
             job.a_pkts.reserve(impl_->replay_a_pkts.size());
             for (AVPacket *src : impl_->replay_a_pkts) {

@@ -3,6 +3,7 @@
 #include "color_math.hpp"
 #include "interactive.hpp"
 #include "kms_capture.hpp"
+#include "pipeline.hpp"
 #include "privileges.hpp"
 #include "types.hpp"
 #include "user_config.hpp"
@@ -109,8 +110,9 @@ void test_cli_and_privileges() {
             // 720p @ 59.998Hz on a GPU without AV1 (HEVC + 10-bit supported)
             ProfileTarget hevc_720p{};
             hevc_720p.width = 1280; hevc_720p.height = 720; hevc_720p.refresh_hz = 59.998;
-            hevc_720p.has_av1 = false; hevc_720p.has_hevc = true; hevc_720p.has_h264 = true;
-            hevc_720p.supports_10bit = true;
+            hevc_720p.av1.supported = false;
+            hevc_720p.hevc.supported = true; hevc_720p.hevc.supports_10bit = true;
+            hevc_720p.h264.supported = true;
             Config c_def{}, c_gp{}, c_m{}, c_d{};
             check(apply_profile(c_def, "default", hevc_720p).has_value(), "apply default hevc 720p");
             check(c_def.codec == Codec::Hevc && c_def.fps == 60 &&
@@ -137,7 +139,7 @@ void test_cli_and_privileges() {
             // 4K @ 144Hz on AV1 GPU with max_hw_bitrate cap
             ProfileTarget av1_4k{};
             av1_4k.width = 3840; av1_4k.height = 2160; av1_4k.refresh_hz = 144.0;
-            av1_4k.max_hw_bitrate = 80'000'000;
+            av1_4k.av1.max_hw_bitrate = 80'000'000;
             Config c4k_def{}, c4k_gp{};
             check(apply_profile(c4k_def, "default", av1_4k).has_value(), "apply default 4k");
             check(c4k_def.codec == Codec::Av1 && c4k_def.bitrate >= 32'000'000 && c4k_def.bitrate <= 42'000'000,
@@ -148,15 +150,251 @@ void test_cli_and_privileges() {
             // Driver that lacks VBR (CQP-only) and lacks 10-bit P010
             ProfileTarget cqp_only{};
             cqp_only.width = 1920; cqp_only.height = 1080; cqp_only.refresh_hz = 60.0;
-            cqp_only.has_av1 = false; cqp_only.has_hevc = true; cqp_only.has_h264 = true;
-            cqp_only.supports_10bit = false; cqp_only.supports_vbr = false; cqp_only.supports_cqp = true;
-            cqp_only.max_quality_levels = 1;
+            cqp_only.av1.supported = false;
+            cqp_only.hevc.supported = true;
+            cqp_only.hevc.supports_10bit = false;
+            cqp_only.hevc.supports_vbr = false;
+            cqp_only.hevc.supports_cqp = true;
+            cqp_only.hevc.max_quality_levels = 1;
+            cqp_only.h264.supported = true;
             Config cc_def{}, cc_10{};
             check(apply_profile(cc_def, "default", cqp_only).has_value(), "apply default cqp-only");
             check(cc_def.rc == RateControl::Cqp && cc_def.qp == 22, "VBR-unsupported GPU falls back to CQP");
             check(apply_profile(cc_10, "gameplay-10bit", cqp_only).has_value(), "apply 10bit on 8bit-only HEVC");
             check(cc_10.pixfmt == PixelFormat::Nv12 && cc_10.dither && cc_10.quality == 0,
                   "8-bit-only HEVC falls back to NV12+dither and clamps quality to 0");
+
+            // Zero encode extensions: must fail cleanly with informative error
+            ProfileTarget no_enc{};
+            no_enc.av1.supported = false;
+            no_enc.hevc.supported = false;
+            no_enc.h264.supported = false;
+            no_enc.gpu_name = "Test Software GPU";
+            check(!best_codec_for(no_enc).has_value(), "no_enc -> best_codec_for is nullopt");
+            check(describe_profiles(no_enc).empty(), "no_enc -> describe_profiles is empty");
+            Config c_no_enc{};
+            auto no_enc_res = apply_profile(c_no_enc, "default", no_enc);
+            check(!no_enc_res.has_value() && no_enc_res.error().find("Test Software GPU") != std::string::npos,
+                  "no_enc -> apply_profile fails with GPU name");
+            auto adapt_no_enc = adapt_config_to_target(c_no_enc, no_enc);
+            check(!adapt_no_enc.has_value(), "no_enc -> adapt_config_to_target fails");
+
+            // Explicit CLI overrides must be respected when computing bitrate/QP/per-codec caps
+            {
+                ProfileTarget mixed_gpu{};
+                mixed_gpu.width = 2560; mixed_gpu.height = 1440; mixed_gpu.refresh_hz = 144.0;
+                mixed_gpu.av1 = {true, true, true, true, true, 3, 4096, 4096, 0};
+                mixed_gpu.hevc = {true, false, false, true, false, 1, 4096, 4096, 0};
+                mixed_gpu.h264 = {true, false, true, true, true, 2, 4096, 4096, 0};
+
+                // -p master --codec h264 on AV1 GPU must get H.264 QP 18 + NV12 (not AV1 QP 36 + P010)
+                const char *a1[] = {"vkcap", "-p", "master", "--codec", "h264", "-o", "t.mkv"};
+                auto cfg1 = parse_args(static_cast<int>(std::size(a1)), const_cast<char **>(a1));
+                check(cfg1.has_value(), "parse -p master --codec h264");
+                check(adapt_config_to_target(*cfg1, mixed_gpu).has_value(), "adapt -p master --codec h264");
+                check(cfg1->codec == Codec::H264 && cfg1->rc == RateControl::Cqp && cfg1->qp == 18 &&
+                      cfg1->pixfmt == PixelFormat::Nv12,
+                      "-p master --codec h264 gets H.264 QP 18 and NV12");
+
+                // --codec h264 (default profile) must scale bitrate for H.264 (~31M, not AV1 20M)
+                const char *a2[] = {"vkcap", "--codec", "h264", "-o", "t.mkv"};
+                auto cfg2 = parse_args(static_cast<int>(std::size(a2)), const_cast<char **>(a2));
+                check(cfg2.has_value() && adapt_config_to_target(*cfg2, mixed_gpu).has_value(), "adapt --codec h264");
+                check(cfg2->codec == Codec::H264 && cfg2->bitrate >= 29'000'000 && cfg2->bitrate <= 33'000'000,
+                      "--codec h264 scales bitrate to ~31M");
+
+                // -f 120 (default profile) must scale bitrate for 120 fps (~34M, not 60 fps 20M)
+                const char *a3[] = {"vkcap", "-f", "120", "-o", "t.mkv"};
+                auto cfg3 = parse_args(static_cast<int>(std::size(a3)), const_cast<char **>(a3));
+                check(cfg3.has_value() && adapt_config_to_target(*cfg3, mixed_gpu).has_value(), "adapt -f 120");
+                check(cfg3->fps == 120 && cfg3->bitrate >= 32'000'000 && cfg3->bitrate <= 36'000'000,
+                      "-f 120 scales default bitrate to ~34M");
+
+                // --codec hevc uses HEVC's per-codec caps (CQP-only, 8-bit, quality 0), not AV1's
+                const char *a4[] = {"vkcap", "-p", "gameplay-10bit", "--codec", "hevc", "-o", "t.mkv"};
+                auto cfg4 = parse_args(static_cast<int>(std::size(a4)), const_cast<char **>(a4));
+                check(cfg4.has_value() && adapt_config_to_target(*cfg4, mixed_gpu).has_value(), "adapt --codec hevc");
+                check(cfg4->codec == Codec::Hevc && cfg4->rc == RateControl::Cqp && cfg4->qp == 22 &&
+                      cfg4->pixfmt == PixelFormat::Nv12 && cfg4->quality == 0,
+                      "--codec hevc uses HEVC per-codec caps instead of AV1 caps");
+            }
+
+            // 10-bit does not incur a spurious bitrate penalty
+            check(recommended_bitrate(2560, 1440, 60, Codec::Av1, PixelFormat::Nv12, 20.0) ==
+                  recommended_bitrate(2560, 1440, 60, Codec::Av1, PixelFormat::P010, 20.0),
+                  "recommended_bitrate does not penalize P010");
+
+            // Resolution clamping to encoder maxCodedExtent
+            {
+                auto [cw, ch] = clamp_resolution_to_encoder(5120, 1440, 4096, 4096);
+                check(cw == 4096 && ch == 1152, "clamp 5120x1440 to 4096x4096 -> 4096x1152");
+                auto [nw, nh] = clamp_resolution_to_encoder(2560, 1440, 4096, 4096);
+                check(nw == 2560 && nh == 1440, "within limits unchanged");
+                auto [uw, uh] = clamp_resolution_to_encoder(3840, 2160, 0, 0);
+                check(uw == 3840 && uh == 2160, "0 max extent means unlimited");
+            }
+
+            // Container / codec compatibility checks
+            check(check_container_compatibility("out.webm", Codec::H264, true, AudioCodec::Opus).has_value(),
+                  "H.264 in .webm flagged");
+            check(check_container_compatibility("out.ivf", Codec::Hevc, false, AudioCodec::Opus).has_value(),
+                  "HEVC in .ivf flagged");
+            check(check_container_compatibility("out.ivf", Codec::Av1, true, AudioCodec::Opus).has_value(),
+                  "Audio in .ivf flagged");
+            check(!check_container_compatibility("out.mkv", Codec::Hevc, true, AudioCodec::Flac).has_value(),
+                  "HEVC + FLAC in .mkv is valid");
+
+            // FramePacer: drift-free deadlines, stall recovery without shifting base_ns, rational vblank locking
+            {
+                const int64_t t0 = 10'000'000'000LL;
+                // 144 Hz -> 60 fps (12/5) and 165 Hz -> 60 fps (11/4) use rational beat-centering lock
+                FramePacer p144(t0, 60, 144.0);
+                check(p144.vblank_lock_eligible() && p144.vblank_denominator() == 5,
+                      "144Hz@60fps uses 12/5 rational beat-centering lock");
+                check(p144.next_target_ns(60000, 0) == t0 + 1'000'000'000'000LL, "zero drift over 60000 frames");
+
+                FramePacer p165(t0, 60, 165.0);
+                check(p165.vblank_lock_eligible() && p165.vblank_denominator() == 4,
+                      "165Hz@60fps uses 11/4 rational beat-centering lock");
+
+                // Sub-ms comb refresh rate (e.g. 175 Hz @ 60 fps = 35/12, comb < 1 ms) keeps lock off
+                FramePacer p175(t0, 60, 175.0);
+                check(!p175.vblank_lock_eligible(), "175Hz@60fps keeps vblank lock off");
+
+                // Mid-recording modeset update preserves immutable base_ns
+                p175.update_refresh_hz(240.0);
+                check(p175.vblank_lock_eligible() && p175.vblank_denominator() == 1 && p175.base_ns() == t0,
+                      "update_refresh_hz adapts to modeset without shifting base_ns");
+
+                // Verify 143.98 Hz @ 60 fps stays centered away from every vblank commit across 2000 frames
+                {
+                    FramePacer p144s(t0, 60, 143.98);
+                    const int64_t vb_period = static_cast<int64_t>(std::llround(1e9 / 143.98));
+                    const int64_t vb_origin = t0 + 100'000LL;  // worst-case initial alignment right on vblank
+                    int safe_frames = 0;
+                    for (int64_t fi = 1; fi <= 2000; ++fi) {
+                        const int64_t target = p144s.next_target_ns(fi, 0);
+                        const int64_t k = (target - vb_origin) / vb_period;
+                        const int64_t cur_vb = vb_origin + k * vb_period;
+                        p144s.observe_vblank(cur_vb, fi, target, 0);
+                        if (fi > 15) {
+                            const int64_t since_vb = target - cur_vb;
+                            const int64_t until_vb = (cur_vb + vb_period) - target;
+                            if (std::min(since_vb, until_vb) >= 400'000LL) {
+                                ++safe_frames;
+                            }
+                        }
+                    }
+                    check(safe_frames >= 1970, "143.98Hz@60fps stays >=0.4ms away from vblank commits");
+                }
+
+                // Stall recovery advances frame_idx to wall-clock tick and preserves base_ns
+                int64_t fidx = 10;
+                const int64_t stalled_now = t0 + 500'000'000LL;  // 0.5s elapsed -> tick 30
+                check(p144.recover_if_stalled(fidx, stalled_now, 0), "stall recovery triggers");
+                check(fidx == 30 && p144.base_ns() == t0, "stall advances frame_idx to 30 without mutating base_ns");
+
+                // 59.94 Hz -> 60 fps and 119.88 Hz -> 60 fps are eligible for vblank phase-locking
+                FramePacer p60(t0, 60, 59.94);
+                check(p60.vblank_lock_eligible(), "59.94Hz@60fps eligible for vblank lock");
+                // Suppose vblank happens 6 ms after t0: pacer snaps phase so wake-up lands ~1.5 ms after vblank
+                const int64_t vb1 = t0 + 6'000'000LL;
+                p60.observe_vblank(vb1, 1, vb1 + 200'000LL, 0);
+                const int64_t target1 = p60.next_target_ns(1, 0);
+                const int64_t ideal1 = vb1 + 16'683'350LL + 1'500'000LL;  // next vblank + 1.5 ms lead
+                check(std::abs(target1 - ideal1) < 250'000LL, "vblank phase-lock snaps to post-vblank lead");
+
+                // VRR / unstable vblank interval (>5% off) must be ignored (no wild phase jitter)
+                const int64_t phase_before = p60.phase_offset_ns();
+                const int64_t vrr_vb = vb1 + 25'000'000LL;  // 40 Hz VRR dip
+                p60.observe_vblank(vrr_vb, 2, vrr_vb + 200'000LL, 0);
+                check(p60.phase_offset_ns() == phase_before, "VRR interval spike ignored");
+
+                // Stale vblank (PSR idle) must be ignored
+                p60.observe_vblank(vb1, 3, vb1 + 100'000'000LL, 0);
+                check(p60.phase_offset_ns() == phase_before, "stale PSR vblank ignored");
+
+                // Long-run 59.94 Hz @ 60 fps simulation: must wrap cleanly without clamping or slewing across vblank
+                {
+                    FramePacer p5994(t0, 60, 59.94);
+                    const int64_t vb_period = 16'683'350LL;  // 1e9 / 59.94
+                    const int64_t vb_origin = t0 + 3'000'000LL;
+                    int locked_frames = 0;
+                    for (int64_t fi = 1; fi <= 2000; ++fi) {
+                        const int64_t target = p5994.next_target_ns(fi, 0);
+                        // Latest vblank at or before target
+                        const int64_t k = (target - vb_origin) / vb_period;
+                        const int64_t cur_vb = vb_origin + k * vb_period;
+                        p5994.observe_vblank(cur_vb, fi, target, 0);
+                        const int64_t delta = target - (cur_vb + 1'500'000LL);
+                        if (fi > 10 && std::abs(delta) < 500'000LL) {
+                            ++locked_frames;
+                        }
+                    }
+                    check(p5994.vblank_wraps() >= 1, "59.94Hz@60fps performs atomic phase wrap");
+                    check(std::abs(p5994.phase_offset_ns()) <= vb_period / 2, "phase_offset remains bounded");
+                    check(locked_frames >= 1980, "59.94Hz@60fps stays locked to post-vblank lead across wraps");
+                }
+            }
+
+            // AdaptiveAudioBuffer: PI clock-skew tracking (+100 ppm & -100 ppm) + 1024-quantum glitch check
+            {
+                auto test_skew = [](double skew_ppm, size_t pw_quantum, const char *label) {
+                    AdaptiveAudioBuffer abuf(AdaptiveAudioBuffer::kDefaultTargetCushion);
+                    abuf.reset();
+                    constexpr size_t kBlock = 960;
+                    std::vector<float> in_buf(pw_quantum * 4, 0.0f);
+                    std::vector<float> out_buf(kBlock * 2, 0.0f);
+
+                    double pw_acc = static_cast<double>(AdaptiveAudioBuffer::kDefaultTargetCushion);
+                    const double push_rate = static_cast<double>(kBlock) * (1.0 + skew_ppm * 1e-6);
+                    uint64_t phase = 0;
+                    float prev_l = 0.0f;
+                    bool had_signal = false;
+                    float max_delta = 0.0f;
+
+                    // Simulate 100 seconds (5000 x 20 ms ticks) with discrete PipeWire quantum bursts
+                    for (int tick = 0; tick < 5000; ++tick) {
+                        pw_acc += push_rate;
+                        while (pw_acc >= static_cast<double>(pw_quantum)) {
+                            pw_acc -= static_cast<double>(pw_quantum);
+                            for (size_t i = 0; i < pw_quantum; ++i) {
+                                float v = 0.25f * std::sin(2.0f * 3.14159265f * 440.0f * static_cast<float>(phase + i) / 48000.0f);
+                                in_buf[i * 2] = v;
+                                in_buf[i * 2 + 1] = v;
+                            }
+                            phase += pw_quantum;
+                            abuf.push_frames(in_buf.data(), pw_quantum);
+                        }
+                        abuf.pop_resampled(out_buf.data(), kBlock);
+                        // After initial fade-in (tick >= 5), verify continuous click-free sine waveform
+                        if (tick >= 5) {
+                            for (size_t i = 0; i < kBlock; ++i) {
+                                const float cur_l = out_buf[i * 2];
+                                if (had_signal) {
+                                    max_delta = std::max(max_delta, std::abs(cur_l - prev_l));
+                                }
+                                prev_l = cur_l;
+                                had_signal = true;
+                            }
+                        }
+                    }
+                    const auto st = abuf.stats();
+                    check(st.underruns == 0, label);
+                    check(st.overrun_trims == 0, label);
+                    // True max delta for 440 Hz @ 48 kHz amp 0.25 is ~0.0144; clicks/dropouts would be >> 0.05
+                    check(max_delta < 0.025f, "audio output has zero clicks or discontinuities");
+                    // Over 5000 ticks at +-500 ppm, +-2400 extra/missing frames arrive.
+                    // Staying near 2048 with 0 underruns, 0 trims, and smooth waveform proves zero-drift lock.
+                    const size_t rem = abuf.available_frames();
+                    check(rem >= 800 && rem <= 3600, "audio cushion stays locked near 2048 frames");
+                    check(std::abs(st.ratio_ppm) < 2500, "PI controller stays smoothly bounded");
+                };
+                test_skew(+500.0, 960, "AdaptiveAudioBuffer +500ppm (960q) zero underruns/trims");
+                test_skew(-500.0, 960, "AdaptiveAudioBuffer -500ppm (960q) zero underruns/trims");
+                test_skew(+500.0, 1024, "AdaptiveAudioBuffer +500ppm (1024q) zero underruns/trims");
+                test_skew(-500.0, 2048, "AdaptiveAudioBuffer -500ppm (2048q) zero underruns/trims");
+            }
         }
     }
 
@@ -256,15 +494,15 @@ void test_cli_and_privileges() {
         // 3) Decline saved defaults -> Advanced setup -> decline saving (must preserve previous saved defaults!)
         {
             Config ic3;
-            // use_saved=n, mode=2(advanced), disp=1, codec=2(hevc), pixfmt=2(p010), fps=90, cursor=y, dur=10,
+            // use_saved=n, mode=2(advanced), disp=1, dev=0, codec=2(hevc), pixfmt=2(p010), res=native, fps=90, cursor=y, dur=10,
             // rc=1(vbr), bitrate=30M, max_br=45M, quality=2, tune=1(hq), usage=1(record), content=2(desktop),
-            // idr=180, async=4, b_depth=1, dev=0, qsz=6, gamut=3(srgb), cs=1(bt709), range=2(full),
-            // sys_audio=y, sys_vol=125, mic=n, acodec=3(flac), res=native, out=adv.mkv, save=n
+            // idr=180, async=4, b_depth=1, qsz=6, gamut=3(srgb), cs=1(bt709), range=2(full),
+            // sys_audio=y, sys_vol=125, mic=n, acodec=3(flac), out=adv.mkv, save=n
             std::istringstream in(
-                "n\n2\n1\n2\n2\n90\ny\n10\n"
+                "n\n2\n1\n0\n2\n2\nnative\n90\ny\n10\n"
                 "1\n30M\n45M\n2\n1\n1\n2\n"
-                "180\n4\n1\n0\n6\n3\n1\n2\n"
-                "y\n125\nn\n3\nnative\nadv.mkv\nn\n");
+                "180\n4\n1\n6\n3\n1\n2\n"
+                "y\n125\nn\n3\nadv.mkv\nn\n");
             std::ostringstream out;
             auto w3 = run_interactive_setup(ic3, "vkcap", in, out, tmp_conf);
             check(w3.has_value() && *w3, "advanced wizard confirmed");

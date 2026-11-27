@@ -55,7 +55,7 @@ struct Config {
     PixelFormat pixfmt = PixelFormat::Nv12;
     RateControl rc = RateControl::Auto;
     int qp = -1;              // -1 = unset (when --qp is passed with --rc=auto, selects CQP)
-    int64_t bitrate = 20'000'000;      // bps; default 20M VBR (foolproof bounded bitrate)
+    int64_t bitrate = 20'000'000;      // bps; default 20M VBR (1440p60 reference)
     int64_t max_bitrate = 32'000'000;  // bps; default 32M VBR ceiling
     int quality = -1;         // -1 = auto default (clamped to GPU maxQualityLevels)
     Tune tune = Tune::Hq;
@@ -87,14 +87,9 @@ struct Config {
     bool from_saved_defaults = false;
 };
 
-struct ProfileTarget {
-    uint32_t width = 2560;
-    uint32_t height = 1440;
-    double refresh_hz = 144.0;
-    bool has_av1 = true;
-    bool has_hevc = true;
-    bool has_h264 = true;
-    bool supports_10bit = true;
+struct CodecEncodeCaps {
+    bool supported = false;
+    bool supports_10bit = false;
     bool supports_vbr = true;
     bool supports_cqp = true;
     bool supports_cbr = true;
@@ -102,8 +97,37 @@ struct ProfileTarget {
     uint32_t max_coded_width = 0;
     uint32_t max_coded_height = 0;
     uint64_t max_hw_bitrate = 0;
+};
+
+struct ProfileTarget {
+    uint32_t width = 2560;
+    uint32_t height = 1440;
+    double refresh_hz = 144.0;
+    CodecEncodeCaps av1{true, true, true, true, true, 2, 0, 0, 0};
+    CodecEncodeCaps hevc{true, true, true, true, true, 2, 0, 0, 0};
+    CodecEncodeCaps h264{true, false, true, true, true, 2, 0, 0, 0};
     std::string gpu_name;
     std::string display_label;
+
+    bool has_any_codec() const noexcept {
+        return av1.supported || hevc.supported || h264.supported;
+    }
+    const CodecEncodeCaps &caps_for(Codec c) const noexcept {
+        switch (c) {
+            case Codec::Av1:  return av1;
+            case Codec::Hevc: return hevc;
+            case Codec::H264: return h264;
+        }
+        return av1;
+    }
+    CodecEncodeCaps &caps_for(Codec c) noexcept {
+        switch (c) {
+            case Codec::Av1:  return av1;
+            case Codec::Hevc: return hevc;
+            case Codec::H264: return h264;
+        }
+        return av1;
+    }
 };
 
 struct ProfileInfo {
@@ -118,12 +142,20 @@ struct AdaptiveProfileInfo {
     std::string details;
 };
 
-Codec best_codec_for(const ProfileTarget &target) noexcept;
+std::optional<Codec> best_codec_for(const ProfileTarget &target) noexcept;
+std::string no_encode_support_error(std::string_view gpu_name = {});
 uint32_t recommended_standard_fps(double refresh_hz) noexcept;
 uint32_t recommended_gameplay_fps(double refresh_hz) noexcept;
 int64_t recommended_bitrate(uint32_t width, uint32_t height, uint32_t fps,
                             Codec codec, PixelFormat pixfmt, double base_1440p60_mbps,
                             uint64_t max_hw_bitrate = 0) noexcept;
+std::pair<uint32_t, uint32_t> clamp_resolution_to_encoder(uint32_t width, uint32_t height,
+                                                          uint32_t max_width, uint32_t max_height) noexcept;
+std::expected<void, std::string> adapt_config_to_target(Config &cfg, const ProfileTarget &target);
+std::optional<std::string> check_container_compatibility(std::string_view output_path,
+                                                         Codec vcodec,
+                                                         bool has_audio,
+                                                         AudioCodec acodec);
 
 std::span<const ProfileInfo> builtin_profiles() noexcept;
 std::vector<AdaptiveProfileInfo> describe_profiles(const ProfileTarget &target);

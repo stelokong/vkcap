@@ -27,17 +27,20 @@ struct ComputeStats {
 struct GpuEncodeSupport {
     std::string device_name;
     bool probed = false;
-    bool has_av1 = true;
-    bool has_hevc = true;
-    bool has_h264 = true;
-    bool supports_10bit = true;
-    bool supports_vbr = true;
-    bool supports_cqp = true;
-    bool supports_cbr = true;
-    uint32_t max_quality_levels = 2;
-    uint32_t max_coded_width = 0;
-    uint32_t max_coded_height = 0;
-    uint64_t max_hw_bitrate = 0;
+    CodecEncodeCaps av1{true, true, true, true, true, 2, 0, 0, 0};
+    CodecEncodeCaps hevc{true, true, true, true, true, 2, 0, 0, 0};
+    CodecEncodeCaps h264{true, false, true, true, true, 2, 0, 0, 0};
+
+    bool has_any_codec() const noexcept {
+        return av1.supported || hevc.supported || h264.supported;
+    }
+
+    void apply_to(ProfileTarget &target) const {
+        target.av1 = av1;
+        target.hevc = hevc;
+        target.h264 = h264;
+        target.gpu_name = device_name;
+    }
 };
 
 /// Probes the target Vulkan GPU's hardware Vulkan Video encode extensions and quality levels
@@ -64,8 +67,20 @@ public:
     std::expected<void, std::string> configure_output(uint32_t width, uint32_t height);
 
     /// Imports/looks up the KMS primary (and optional cursor) DMA-BUF surfaces on the isolated
-    /// low-priority compute_dev, runs rgb_to_yuv.comp into an idle AVVkFrame alias, and returns
-    /// the GPU-resident AVFrame ready for Vulkan Video encoding.
+    /// low-priority compute_dev, submits rgb_to_yuv.comp asynchronously into an idle AVVkFrame
+    /// alias, and returns immediately without stalling the capture thread on the GPU fence.
+    /// Caller MUST call wait_slot(sf.slot_idx) before encoding or freeing sf.frame.
+    struct SubmittedFrame {
+        AVFrame *frame = nullptr;
+        uint32_t slot_idx = 0;
+    };
+    std::expected<SubmittedFrame, std::string> submit_frame(const KmsFrame &frame);
+
+    /// Waits for the compute fence of `slot_idx` to complete and releases the slot for reuse.
+    /// Safe to call from the encode thread concurrently with submit_frame() on the capture thread.
+    void wait_slot(uint32_t slot_idx) noexcept;
+
+    /// Synchronous convenience wrapper: calls submit_frame() + wait_slot().
     std::expected<AVFrame *, std::string> process_frame(const KmsFrame &frame);
 
     AVBufferRef *hw_device_ref() const noexcept;

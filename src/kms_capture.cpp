@@ -219,7 +219,22 @@ struct KmsCapture::Impl {
     uint32_t prop_cursor_w = 0;
     uint32_t prop_cursor_h = 0;
 
+    // Cached cursor surface export (cursor fb_id rarely changes; avoids per-frame GETFB2 + PRIME ioctls)
+    uint32_t cached_cursor_fb_id = 0;
+    uint32_t cached_cursor_age = 0;
+    KmsSurface cached_cursor_surface{};
+
+    // Last-grab state for zero-ioctl duplicate-frame detection when CRTC vblank has not advanced
+    uint64_t last_vblank_seq = 0;
+    uint32_t last_primary_fb_id = 0;
+    uint32_t last_cursor_fb_id = 0;
+    int32_t last_cursor_x = 0;
+    int32_t last_cursor_y = 0;
+    uint32_t last_cursor_w = 0;
+    uint32_t last_cursor_h = 0;
+
     ~Impl() {
+        cached_cursor_surface.close_fds();
         if (drm_fd >= 0) {
             ::close(drm_fd);
             drm_fd = -1;
@@ -398,6 +413,12 @@ std::expected<std::unique_ptr<KmsCapture>, std::string> KmsCapture::open(const C
 }
 
 std::expected<KmsFrame, std::string> KmsCapture::grab_frame() {
+    bool unused = false;
+    return grab_frame_dedup(0, unused);
+}
+
+std::expected<KmsFrame, std::string> KmsCapture::grab_frame_dedup(uint64_t vblank_seq, bool &out_unchanged) {
+    out_unchanged = false;
     // 1. Query primary plane FB_ID via direct stack ioctl (0 heap allocations, 1 ioctl)
     uint32_t fb_id = 0;
     if (impl_->display.primary_plane_id != 0) {
@@ -458,8 +479,61 @@ std::expected<KmsFrame, std::string> KmsCapture::grab_frame() {
         }
     }
 
-    // 3. Single ScopedCapSysAdmin window for both primary + cursor FB2/PRIME exports
-    //    (cuts SYS_capset syscalls from 8/frame down to 2/frame!)
+    // Zero-ioctl duplicate-frame fast-path: if the CRTC vblank sequence has not advanced since
+    // our last grab AND primary fb_id + cursor state are identical, no scanout flip occurred.
+    if (vblank_seq != 0 &&
+        vblank_seq == impl_->last_vblank_seq &&
+        fb_id == impl_->last_primary_fb_id &&
+        c_fb == impl_->last_cursor_fb_id &&
+        cx == impl_->last_cursor_x &&
+        cy == impl_->last_cursor_y &&
+        cw == impl_->last_cursor_w &&
+        ch == impl_->last_cursor_h) {
+        out_unchanged = true;
+        return KmsFrame{};
+    }
+
+    auto dup_surface = [](const KmsSurface &src) -> std::optional<KmsSurface> {
+        KmsSurface dst = src;
+        for (uint32_t i = 0; i < dst.num_planes; ++i) dst.planes[i].fd = -1;
+        for (uint32_t i = 0; i < src.num_planes; ++i) {
+            if (src.planes[i].fd < 0) continue;
+            int shared_fd = -1;
+            for (uint32_t j = 0; j < i; ++j) {
+                if (src.planes[j].fd == src.planes[i].fd) {
+                    shared_fd = dst.planes[j].fd;
+                    break;
+                }
+            }
+            if (shared_fd >= 0) {
+                dst.planes[i].fd = shared_fd;
+            } else {
+                int dfd = ::fcntl(src.planes[i].fd, F_DUPFD_CLOEXEC, 0);
+                if (dfd < 0) {
+                    dst.close_fds();
+                    return std::nullopt;
+                }
+                dst.planes[i].fd = dfd;
+            }
+        }
+        return dst;
+    };
+
+    const bool cursor_active = (c_fb != 0 && cw > 0 && ch > 0);
+    if (!cursor_active && impl_->cached_cursor_fb_id != 0) {
+        impl_->cached_cursor_surface.close_fds();
+        impl_->cached_cursor_fb_id = 0;
+        impl_->cached_cursor_age = 0;
+    }
+
+    // Re-validate cached cursor fb_id every 60 frames (~1s) in case the compositor reused the ID
+    const bool cursor_cache_hit = cursor_active &&
+                                  impl_->cached_cursor_fb_id == c_fb &&
+                                  impl_->cached_cursor_surface.width == cw &&
+                                  impl_->cached_cursor_surface.height == ch &&
+                                  impl_->cached_cursor_age < 60u;
+
+    // 3. Single ScopedCapSysAdmin window for primary (+ cursor only on cursor fb_id change)
     KmsFrame frame{};
     {
         ScopedCapSysAdmin cap_guard;
@@ -469,9 +543,16 @@ std::expected<KmsFrame, std::string> KmsCapture::grab_frame() {
         }
         frame.primary = *prim_res;
 
-        if (c_fb != 0 && cw > 0 && ch > 0) {
+        if (cursor_active && !cursor_cache_hit) {
             auto cur_res = export_fb_to_surface_locked(impl_->drm_fd, c_fb);
             if (cur_res) {
+                impl_->cached_cursor_surface.close_fds();
+                impl_->cached_cursor_fb_id = 0;
+                impl_->cached_cursor_age = 0;
+                if (auto cached_copy = dup_surface(*cur_res)) {
+                    impl_->cached_cursor_surface = *cached_copy;
+                    impl_->cached_cursor_fb_id = c_fb;
+                }
                 frame.cursor.visible = true;
                 frame.cursor.x = cx;
                 frame.cursor.y = cy;
@@ -482,7 +563,58 @@ std::expected<KmsFrame, std::string> KmsCapture::grab_frame() {
         }
     }
 
+    if (cursor_cache_hit) {
+        ++impl_->cached_cursor_age;
+        if (auto duped = dup_surface(impl_->cached_cursor_surface)) {
+            frame.cursor.visible = true;
+            frame.cursor.x = cx;
+            frame.cursor.y = cy;
+            frame.cursor.width = static_cast<int32_t>(cw);
+            frame.cursor.height = static_cast<int32_t>(ch);
+            frame.cursor.surface = *duped;
+        }
+    }
+
+    impl_->last_vblank_seq = vblank_seq;
+    impl_->last_primary_fb_id = fb_id;
+    impl_->last_cursor_fb_id = c_fb;
+    impl_->last_cursor_x = cx;
+    impl_->last_cursor_y = cy;
+    impl_->last_cursor_w = cw;
+    impl_->last_cursor_h = ch;
+
     return frame;
+}
+
+std::optional<KmsCapture::VblankInfo> KmsCapture::query_vblank() const noexcept {
+    if (!impl_ || impl_->drm_fd < 0 || impl_->display.crtc_id == 0) {
+        return std::nullopt;
+    }
+    drm_crtc_get_sequence seq{};
+    seq.crtc_id = impl_->display.crtc_id;
+    if (::ioctl(impl_->drm_fd, DRM_IOCTL_CRTC_GET_SEQUENCE, &seq) == 0 && seq.sequence_ns > 0) {
+        return VblankInfo{seq.sequence, static_cast<int64_t>(seq.sequence_ns)};
+    }
+    return std::nullopt;
+}
+
+std::optional<int64_t> KmsCapture::query_vblank_ns() const noexcept {
+    if (auto vb = query_vblank()) return vb->ns;
+    return std::nullopt;
+}
+
+std::optional<double> KmsCapture::query_refresh_hz() const noexcept {
+    if (!impl_ || impl_->drm_fd < 0 || impl_->display.crtc_id == 0) {
+        return std::nullopt;
+    }
+    drm_mode_crtc crtc{};
+    crtc.crtc_id = impl_->display.crtc_id;
+    if (::ioctl(impl_->drm_fd, DRM_IOCTL_MODE_GETCRTC, &crtc) == 0 &&
+        crtc.mode_valid && crtc.mode.htotal > 0 && crtc.mode.vtotal > 0) {
+        return (static_cast<double>(crtc.mode.clock) * 1000.0) /
+               (static_cast<double>(crtc.mode.htotal) * crtc.mode.vtotal);
+    }
+    return std::nullopt;
 }
 
 const KmsDisplayInfo &KmsCapture::display() const noexcept {
