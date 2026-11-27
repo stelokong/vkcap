@@ -224,7 +224,7 @@ While recording, `vkcap` prints a live single-line status bar with elapsed time,
   │                        ZERO-COPY VIDEO PATH                             │
   │                                                                         │
   │  DRM/KMS Primary Plane (FB2) ─┐                                         │
-  │  (SRC_X/Y/W/H multi-mon crop) ├─▶ [vkcap] Direct stack ioctls           │
+  │  (SRC_X/Y/W/H multi-mon crop) ├─▶ [vkcap] Direct stack ioctls          │
   │  DRM/KMS Cursor Plane  (FB2) ─┘   Rational vblank pacer + TIMER_ABSTIME │
   │  (borrowed cursor FD + dedup)     │                                     │
   │                                   ▼ DMA-BUF fd (12-entry MRU + _SRGB)   │
@@ -246,13 +246,13 @@ While recording, `vkcap` prints a live single-line status bar with elapsed time,
   ┌───────────────────────────────────┴─────────────────────┼───────────────┐
   │                  ZERO-DRIFT LOW-LATENCY AUDIO PATH      │               │
   │                                                         │               │
-  │  PipeWire Sink Monitor (F32) ─▶ Lock-free SPSC + PI Cubic ─┐            │
-  │  PipeWire Selected Mic (F32) ─▶ Lock-free SPSC + PI Cubic ─┼┐           │
-  │  [vkcap-audio-pw RT thread]     (42.7ms cushion, 2-pole LP, ││           │
-  │  (param_changed mono/5.1 fold)   zero-dropout pause resume) ││           │
-  │                                                             ▼▼           │
+  │  PipeWire Sink Monitor (F32) ─▶ Lock-free SPSC + PI Cubic ─┐           │
+  │  PipeWire Selected Mic (F32) ─▶ Lock-free SPSC + PI Cubic ─┼┐          │
+  │  [vkcap-audio-pw RT thread]     (42.7ms cushion, 2-pole LP, ││          │
+  │  (param_changed mono/5.1 fold)   zero-dropout pause resume) ││          │
+  │                                                             ▼▼          │
   │  [vkcap-aenc] Wall-clock 20ms tick (same base_ns)     [vkcap-mux]       │
-  │  Gain (sys/mic %) + soft-limit → Opus/AAC/FLAC ───▶ Recycled AVPacket   │
+  │  Gain (sys/mic %) + soft-limit → Opus/AAC/FLAC ───▶ Recycled AVPacket  │
   │                                                     Ring → libavformat  │
   │                                                     (fMP4 / MKV / WebM) │
   └─────────────────────────────────────────────────────────────────────────┘
