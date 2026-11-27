@@ -3,24 +3,47 @@
 
 // Ultra-fast, high-quality RGB -> NV12 / P010 compute shader with optional
 // zero-copy KMS hardware cursor plane compositing.
-// Compiled twice at build time: -DP010=0 (r8/rg8) and -DP010=1 (r16/rg16).
+// Compiled at build time into:
+//   -DP010=0 -DUSE_FP16=0 (NV12 universal FP32 fallback)
+//   -DP010=0 -DUSE_FP16=1 (NV12 packed FP16 color math for 2x ALU & lower VGPRs)
+//   -DP010=1 -DUSE_FP16=0 (P010 10-bit full FP32 precision)
 // Specialized at pipeline creation via SPIR-V specialization constants so dead
-// branches (scaling, cursor, dither) are completely eliminated from RDNA 4 ISA.
+// branches (scaling, cursor, dither, gamut, linear input, BT.2020 TRC) are
+// completely eliminated from GPU ISA.
 
 #ifndef P010
 #define P010 0
 #endif
 
+#ifndef USE_FP16
+#define USE_FP16 0
+#endif
+
+#if USE_FP16 && !P010
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#define cfloat float16_t
+#define cvec3  f16vec3
+#define cvec4  f16vec4
+#define CF(x)  float16_t(x)
+#else
+#define cfloat float
+#define cvec3  vec3
+#define cvec4  vec4
+#define CF(x)  float(x)
+#endif
+
 // 16x4 = 64 threads (2 Wave32 or 1 Wave64), covering a 32x8 pixel tile per workgroup:
 // - 32-byte coalesced R8 Y stores and 32-byte coalesced RG8 UV stores
 // - 15 of 16 lanes reuse neighbor's right texels via 1-cycle subgroupShuffleUp
-//   (33% fewer texture fetches in 1:1 mode!)
+//   in BOTH 1:1 and scaled modes for accurate AVCHROMA_LOC_LEFT filtering!
 layout(local_size_x = 16, local_size_y = 4, local_size_z = 1) in;
 
-layout(constant_id = 0) const bool kExact1To1 = true;
-layout(constant_id = 1) const bool kHasCursor = false;
-layout(constant_id = 2) const bool kEnableDither = true;
-layout(constant_id = 3) const bool kConvertGamut = false;
+layout(constant_id = 0)  const bool kExact1To1 = true;
+layout(constant_id = 1)  const bool kHasCursor = false;
+layout(constant_id = 2)  const bool kEnableDither = true;
+layout(constant_id = 3)  const bool kConvertGamut = false;
 // Row-major 3x3 linear RGB->RGB gamut matrix (constant-folded into ISA when kConvertGamut=true)
 layout(constant_id = 4)  const float kGm00 = 1.0;
 layout(constant_id = 5)  const float kGm01 = 0.0;
@@ -31,6 +54,10 @@ layout(constant_id = 9)  const float kGm12 = 0.0;
 layout(constant_id = 10) const float kGm20 = 0.0;
 layout(constant_id = 11) const float kGm21 = 0.0;
 layout(constant_id = 12) const float kGm22 = 1.0;
+// True when uSrc already delivers linear light (hardware _SRGB view or FP16 linear scRGB)
+layout(constant_id = 13) const bool kSrcLinear = false;
+// True when target color_trc is BT.2020-10 (applies Rec.2020 OETF instead of sRGB OETF)
+layout(constant_id = 14) const bool kDstBt2020Trc = false;
 
 layout(set = 0, binding = 0) uniform sampler2D uSrc;
 layout(set = 0, binding = 1) uniform sampler2D uCursor;
@@ -83,8 +110,8 @@ Cr1D catmullRom1D(float srcCoord, float invSize) {
     );
 }
 
-// 5-tap Catmull-Rom bicubic sampling using pre-factored 1D weights
-vec3 sampleCatmullRom2D(Cr1D x, Cr1D y) {
+// 5-tap Catmull-Rom bicubic sampling using pre-factored 1D weights (for scale <= ~1.55x)
+cvec3 sampleCatmullRom2D(Cr1D x, Cr1D y) {
     vec3 c = textureLod(uSrc, vec2(x.tc12, y.tc0),  0.0).rgb * (x.w12 * y.w0)
            + textureLod(uSrc, vec2(x.tc0,  y.tc12), 0.0).rgb * (x.w0  * y.w12)
            + textureLod(uSrc, vec2(x.tc12, y.tc12), 0.0).rgb * (x.w12 * y.w12)
@@ -92,24 +119,23 @@ vec3 sampleCatmullRom2D(Cr1D x, Cr1D y) {
            + textureLod(uSrc, vec2(x.tc12, y.tc3),  0.0).rgb * (x.w12 * y.w3);
 
     float wSum = x.w12 * (y.w0 + y.w12 + y.w3) + (x.w0 + x.w3) * y.w12;
-    return clamp(c / max(wSum, 1e-5), 0.0, 1.0);
+    return cvec3(clamp(c / max(wSum, 1e-5), 0.0, 1.0));
 }
 
-vec3 blendCursor(vec3 baseRgb, vec2 srcPx) {
-    vec2 rel = srcPx - pc.cursorRect.xy;
-    if (rel.x < 0.0 || rel.y < 0.0 || rel.x >= pc.cursorRect.z || rel.y >= pc.cursorRect.w) {
-        return baseRgb;
-    }
-    vec2 cuv = (rel + 0.5) * pc.invCursorSize;
-    vec4 cur = textureLod(uCursor, cuv, 0.0);
-    // DRM hardware cursor planes use premultiplied ARGB8888 alpha
-    return clamp(cur.rgb + baseRgb * (1.0 - cur.a), 0.0, 1.0);
+// Anti-aliased 4-tap bilinear supersampled area downscaler for ratios > 1.55x
+// (exact 2x2 box average at 2x, 4x4 at 4x, full footprint coverage across 1.55x..4x with 0 ringing)
+cvec3 sampleDownscaleArea(vec2 srcPx) {
+    vec2 d = 0.25 * pc.srcStepPx;
+    vec3 c = textureLod(uSrc, (srcPx + vec2(-d.x, -d.y)) * pc.invSrcSize, 0.0).rgb
+           + textureLod(uSrc, (srcPx + vec2( d.x, -d.y)) * pc.invSrcSize, 0.0).rgb
+           + textureLod(uSrc, (srcPx + vec2(-d.x,  d.y)) * pc.invSrcSize, 0.0).rgb
+           + textureLod(uSrc, (srcPx + vec2( d.x,  d.y)) * pc.invSrcSize, 0.0).rgb;
+    return cvec3(clamp(c * 0.25, 0.0, 1.0));
 }
 
-// Piecewise sRGB EOTF -> 3x3 linear gamut matrix -> piecewise sRGB OETF.
-// Completely dead-code eliminated when kConvertGamut == false.
-// For 8-bit NV12, uses fast FMA/sqrt approximations (< 0.13 LSB error) instead of 24x pow().
-vec3 srgbToLinear(vec3 c) {
+// Piecewise sRGB EOTF (exact pow() for P010, fast FMA/sqrt approximation < 0.13 LSB for NV12).
+// Completely skipped when kSrcLinear == true (hardware _SRGB texture view or FP16 linear scRGB).
+vec3 srgbToLinearF32(vec3 c) {
     vec3 lo = c * (1.0 / 12.92);
     vec3 t = max((c + 0.055) * (1.0 / 1.055), vec3(0.0));
 #if P010
@@ -121,9 +147,15 @@ vec3 srgbToLinear(vec3 c) {
     return mix(lo, hi, greaterThan(c, vec3(0.04045)));
 }
 
-vec3 linearToSrgb(vec3 c) {
-    vec3 lo = c * 12.92;
-    vec3 cp = max(c, vec3(0.0));
+vec3 linearToTargetOetfF32(vec3 c) {
+    vec3 cp = clamp(c, 0.0, 1.0);
+    if (kDstBt2020Trc) {
+        // ITU-R BT.2020 10-bit OETF (matches AVCOL_TRC_BT2020_10)
+        vec3 lo = cp * 4.5;
+        vec3 hi = 1.09929682680944 * pow(cp, vec3(0.45)) - 0.09929682680944;
+        return mix(lo, hi, greaterThanEqual(cp, vec3(0.018053968510807)));
+    }
+    vec3 lo = cp * 12.92;
 #if P010
     vec3 hi = 1.055 * pow(cp, vec3(1.0 / 2.4)) - 0.055;
 #else
@@ -132,22 +164,47 @@ vec3 linearToSrgb(vec3 c) {
     vec3 s3 = sqrt(s2);
     vec3 hi = 0.662002687 * s1 + 0.684122060 * s2 - 0.323583601 * s3 - 0.0225411470 * cp;
 #endif
-    return mix(lo, hi, greaterThan(c, vec3(0.0031308)));
+    return mix(lo, hi, greaterThan(cp, vec3(0.0031308)));
 }
 
-vec3 convertGamut(vec3 srgb) {
-    vec3 lin = srgbToLinear(srgb);
-    vec3 dst = vec3(
-        kGm00 * lin.r + kGm01 * lin.g + kGm02 * lin.b,
-        kGm10 * lin.r + kGm11 * lin.g + kGm12 * lin.b,
-        kGm20 * lin.r + kGm21 * lin.g + kGm22 * lin.b
-    );
-    return linearToSrgb(clamp(dst, 0.0, 1.0));
+cvec3 blendCursor(cvec3 baseRgb, vec2 srcPx) {
+    vec2 rel = srcPx - pc.cursorRect.xy;
+    if (rel.x < 0.0 || rel.y < 0.0 || rel.x >= pc.cursorRect.z || rel.y >= pc.cursorRect.w) {
+        return baseRgb;
+    }
+    vec2 cuv = (rel + 0.5) * pc.invCursorSize;
+    vec4 cur = textureLod(uCursor, cuv, 0.0);
+    // DRM hardware cursor planes use premultiplied sRGB ARGB8888 alpha
+    if (kSrcLinear) {
+        // Convert premultiplied sRGB cursor into linear light before compositing
+        vec3 curLin = (cur.a > 1e-4)
+            ? (srgbToLinearF32(clamp(cur.rgb / cur.a, 0.0, 1.0)) * cur.a)
+            : vec3(0.0);
+        return cvec3(clamp(curLin + vec3(baseRgb) * (1.0 - cur.a), 0.0, 1.0));
+    }
+    return cvec3(clamp(cur.rgb + vec3(baseRgb) * (1.0 - cur.a), 0.0, 1.0));
+}
+
+// Applies optional 3x3 linear gamut matrix and target OETF (when in linear space or gamut-converting).
+// Dead-code eliminated completely when !kConvertGamut && !kSrcLinear.
+cvec3 finishColor(cvec3 rgb) {
+    if (!kConvertGamut && !kSrcLinear) {
+        return rgb;
+    }
+    vec3 lin = kSrcLinear ? vec3(rgb) : srgbToLinearF32(vec3(rgb));
+    if (kConvertGamut) {
+        lin = vec3(
+            kGm00 * lin.r + kGm01 * lin.g + kGm02 * lin.b,
+            kGm10 * lin.r + kGm11 * lin.g + kGm12 * lin.b,
+            kGm20 * lin.r + kGm21 * lin.g + kGm22 * lin.b
+        );
+    }
+    return cvec3(linearToTargetOetfF32(lin));
 }
 
 #if !P010
 // Zero-sqrt static spatial Interleaved Gradient Noise -> triangular PDF in [-0.5, +0.5] LSB
-// Uses difference of two uncorrelated uniform IGN hashes (pure full-rate VALU, zero SFU sqrt)
+// Coordinates remain FP32 to preserve sub-pixel hash precision across 4K+ extents.
 const vec2 kIgnVec = vec2(0.06711056, 0.00583715);
 
 float ignTriangular(vec2 p) {
@@ -176,15 +233,15 @@ void main() {
     ivec2 c01 = ivec2(c00.x, c00.y + 1);
     ivec2 c11 = ivec2(c00.x + 1, c00.y + 1);
 
-    vec3 rgb00, rgb10, rgb01, rgb11;
-    vec3 chromaRgb;
+    cvec3 rgb00, rgb10, rgb01, rgb11;
+    cvec3 chromaRgb;
 
     if (kExact1To1) {
         ivec2 off = ivec2(pc.srcOffset);
-        rgb00 = texelFetch(uSrc, off + c00, 0).rgb;
-        rgb10 = texelFetch(uSrc, off + c10, 0).rgb;
-        rgb01 = texelFetch(uSrc, off + c01, 0).rgb;
-        rgb11 = texelFetch(uSrc, off + c11, 0).rgb;
+        rgb00 = cvec3(texelFetch(uSrc, off + c00, 0).rgb);
+        rgb10 = cvec3(texelFetch(uSrc, off + c10, 0).rgb);
+        rgb01 = cvec3(texelFetch(uSrc, off + c01, 0).rgb);
+        rgb11 = cvec3(texelFetch(uSrc, off + c11, 0).rgb);
 
         if (kHasCursor) {
             vec2 p00 = vec2(off + c00);
@@ -197,24 +254,24 @@ void main() {
             }
         }
 
-        if (kConvertGamut) {
-            rgb00 = convertGamut(rgb00);
-            rgb10 = convertGamut(rgb10);
-            rgb01 = convertGamut(rgb01);
-            rgb11 = convertGamut(rgb11);
+        if (kConvertGamut || kSrcLinear) {
+            rgb00 = finishColor(rgb00);
+            rgb10 = finishColor(rgb10);
+            rgb01 = finishColor(rgb01);
+            rgb11 = finishColor(rgb11);
         }
 
         // Uniform subgroup shuffle: lane x (1..15) gets left neighbor's (x-1) right pixels
-        // directly from VGPRs (zero extra texture fetches, already cursor-blended & gamut-converted!).
-        vec3 shufL0 = subgroupShuffleUp(rgb10, 1u);
-        vec3 shufL1 = subgroupShuffleUp(rgb11, 1u);
+        // directly from VGPRs (zero extra texture fetches, already cursor-blended & color-converted!).
+        cvec3 shufL0 = subgroupShuffleUp(rgb10, 1u);
+        cvec3 shufL1 = subgroupShuffleUp(rgb11, 1u);
 
-        vec3 rgbL0, rgbL1;
+        cvec3 rgbL0, rgbL1;
         // Also guard gl_SubgroupInvocationID == 0u for SIMD8 GPUs (e.g. Intel ANV)
         if (gl_LocalInvocationID.x == 0u || gl_SubgroupInvocationID == 0u) {
             int lx = max(off.x + c00.x - 1, off.x);
-            rgbL0 = texelFetch(uSrc, ivec2(lx, off.y + c00.y), 0).rgb;
-            rgbL1 = texelFetch(uSrc, ivec2(lx, off.y + c01.y), 0).rgb;
+            rgbL0 = cvec3(texelFetch(uSrc, ivec2(lx, off.y + c00.y), 0).rgb);
+            rgbL1 = cvec3(texelFetch(uSrc, ivec2(lx, off.y + c01.y), 0).rgb);
             if (kHasCursor) {
                 vec2 pL = vec2(float(lx), float(off.y + c00.y));
                 if (pL.x + 1.0 >= pc.cursorRect.x && pL.x <= pc.cursorRect.x + pc.cursorRect.z &&
@@ -223,9 +280,9 @@ void main() {
                     rgbL1 = blendCursor(rgbL1, pL + vec2(0.0, 1.0));
                 }
             }
-            if (kConvertGamut) {
-                rgbL0 = convertGamut(rgbL0);
-                rgbL1 = convertGamut(rgbL1);
+            if (kConvertGamut || kSrcLinear) {
+                rgbL0 = finishColor(rgbL0);
+                rgbL1 = finishColor(rgbL1);
             }
         } else {
             rgbL0 = shufL0;
@@ -238,21 +295,30 @@ void main() {
 
         // MPEG-2 / AVCHROMA_LOC_LEFT 3x2 anti-aliased chroma filter:
         // horizontal [1, 2, 1]/4 centered on left column, vertical [1, 1]/2
-        chromaRgb = 0.125 * (rgbL0 + rgbL1 + rgb10 + rgb11) + 0.25 * (rgb00 + rgb01);
+        chromaRgb = CF(0.125) * (rgbL0 + rgbL1 + rgb10 + rgb11) + CF(0.25) * (rgb00 + rgb01);
     } else {
-        if (!inBounds) {
-            return;
-        }
+        // Uniform control flow before subgroupShuffleUp (out-of-bounds c00 is clamped safely)
         vec2 px00 = pc.srcBasePx + vec2(c00) * pc.srcStepPx;
         vec2 px11 = px00 + pc.srcStepPx;
-        Cr1D cx0 = catmullRom1D(px00.x, pc.invSrcSize.x);
-        Cr1D cx1 = catmullRom1D(px11.x, pc.invSrcSize.x);
-        Cr1D cy0 = catmullRom1D(px00.y, pc.invSrcSize.y);
-        Cr1D cy1 = catmullRom1D(px11.y, pc.invSrcSize.y);
-        rgb00 = sampleCatmullRom2D(cx0, cy0);
-        rgb10 = sampleCatmullRom2D(cx1, cy0);
-        rgb01 = sampleCatmullRom2D(cx0, cy1);
-        rgb11 = sampleCatmullRom2D(cx1, cy1);
+        const bool wideDownscale = (pc.srcStepPx.x > 1.55) || (pc.srcStepPx.y > 1.55);
+
+        Cr1D cy0, cy1;
+        if (wideDownscale) {
+            rgb00 = sampleDownscaleArea(px00);
+            rgb10 = sampleDownscaleArea(vec2(px11.x, px00.y));
+            rgb01 = sampleDownscaleArea(vec2(px00.x, px11.y));
+            rgb11 = sampleDownscaleArea(px11);
+        } else {
+            Cr1D cx0 = catmullRom1D(px00.x, pc.invSrcSize.x);
+            Cr1D cx1 = catmullRom1D(px11.x, pc.invSrcSize.x);
+            cy0 = catmullRom1D(px00.y, pc.invSrcSize.y);
+            cy1 = catmullRom1D(px11.y, pc.invSrcSize.y);
+            rgb00 = sampleCatmullRom2D(cx0, cy0);
+            rgb10 = sampleCatmullRom2D(cx1, cy0);
+            rgb01 = sampleCatmullRom2D(cx0, cy1);
+            rgb11 = sampleCatmullRom2D(cx1, cy1);
+        }
+
         if (kHasCursor) {
             vec2 p00 = px00 - 0.5;
             vec2 p11 = px11 - 0.5;
@@ -264,24 +330,64 @@ void main() {
                 rgb11 = blendCursor(rgb11, p11);
             }
         }
-        if (kConvertGamut) {
-            rgb00 = convertGamut(rgb00);
-            rgb10 = convertGamut(rgb10);
-            rgb01 = convertGamut(rgb01);
-            rgb11 = convertGamut(rgb11);
+        if (kConvertGamut || kSrcLinear) {
+            rgb00 = finishColor(rgb00);
+            rgb10 = finishColor(rgb10);
+            rgb01 = finishColor(rgb01);
+            rgb11 = finishColor(rgb11);
         }
-        chromaRgb = 0.25 * (rgb00 + rgb10 + rgb01 + rgb11);
+
+        // Same AVCHROMA_LOC_LEFT 3x2 filter via subgroupShuffleUp in scaled mode:
+        // eliminates the 0.5 px horizontal chroma shift with 0 extra texture fetches for 15/16 lanes.
+        cvec3 shufL0 = subgroupShuffleUp(rgb10, 1u);
+        cvec3 shufL1 = subgroupShuffleUp(rgb11, 1u);
+
+        cvec3 rgbL0, rgbL1;
+        if (gl_LocalInvocationID.x == 0u || gl_SubgroupInvocationID == 0u) {
+            float pxL = max(px00.x - pc.srcStepPx.x, pc.srcBasePx.x);
+            if (wideDownscale) {
+                rgbL0 = sampleDownscaleArea(vec2(pxL, px00.y));
+                rgbL1 = sampleDownscaleArea(vec2(pxL, px11.y));
+            } else {
+                Cr1D cxL = catmullRom1D(pxL, pc.invSrcSize.x);
+                rgbL0 = sampleCatmullRom2D(cxL, cy0);
+                rgbL1 = sampleCatmullRom2D(cxL, cy1);
+            }
+            if (kHasCursor) {
+                vec2 pL0 = vec2(pxL - 0.5, px00.y - 0.5);
+                vec2 pL1 = vec2(pxL - 0.5, px11.y - 0.5);
+                if (pL0.x >= pc.cursorRect.x && pL0.x < pc.cursorRect.x + pc.cursorRect.z &&
+                    pL1.y >= pc.cursorRect.y && pL0.y < pc.cursorRect.y + pc.cursorRect.w) {
+                    rgbL0 = blendCursor(rgbL0, pL0);
+                    rgbL1 = blendCursor(rgbL1, pL1);
+                }
+            }
+            if (kConvertGamut || kSrcLinear) {
+                rgbL0 = finishColor(rgbL0);
+                rgbL1 = finishColor(rgbL1);
+            }
+        } else {
+            rgbL0 = shufL0;
+            rgbL1 = shufL1;
+        }
+
+        if (!inBounds) {
+            return;
+        }
+
+        chromaRgb = CF(0.125) * (rgbL0 + rgbL1 + rgb10 + rgb11) + CF(0.25) * (rgb00 + rgb01);
     }
 
-    vec4 ys = vec4(
-        dot(pc.yCoeffs.xyz, rgb00),
-        dot(pc.yCoeffs.xyz, rgb10),
-        dot(pc.yCoeffs.xyz, rgb01),
-        dot(pc.yCoeffs.xyz, rgb11)
-    ) + pc.yCoeffs.w;
+    cvec3 yW = cvec3(pc.yCoeffs.xyz);
+    cvec4 ys = cvec4(
+        dot(yW, rgb00),
+        dot(yW, rgb10),
+        dot(yW, rgb01),
+        dot(yW, rgb11)
+    ) + cfloat(pc.yCoeffs.w);
 
-    float cb = dot(pc.cbCoeffs.xyz, chromaRgb) + pc.cbCoeffs.w;
-    float cr = dot(pc.crCoeffs.xyz, chromaRgb) + pc.crCoeffs.w;
+    cfloat cb = dot(cvec3(pc.cbCoeffs.xyz), chromaRgb) + cfloat(pc.cbCoeffs.w);
+    cfloat cr = dot(cvec3(pc.crCoeffs.xyz), chromaRgb) + cfloat(pc.crCoeffs.w);
 
 #if P010
     ys = round(clamp(ys, 0.0, 1.0) * 1023.0) * (64.0 / 65535.0);
@@ -289,19 +395,19 @@ void main() {
     cr = round(clamp(cr, 0.0, 1.0) * 1023.0) * (64.0 / 65535.0);
 #else
     if (kEnableDither) {
-        ys += ignTriangular2x2(vec2(c00));
-        float dc = ignTriangular(vec2(uvCoord));
+        ys += cvec4(ignTriangular2x2(vec2(c00)));
+        cfloat dc = cfloat(ignTriangular(vec2(uvCoord)));
         cb += dc;
         cr -= dc;
     }
-    ys = clamp(ys, 0.0, 1.0);
-    cb = clamp(cb, 0.0, 1.0);
-    cr = clamp(cr, 0.0, 1.0);
+    ys = clamp(ys, CF(0.0), CF(1.0));
+    cb = clamp(cb, CF(0.0), CF(1.0));
+    cr = clamp(cr, CF(0.0), CF(1.0));
 #endif
 
-    imageStore(uDstY, c00, vec4(ys.x, 0.0, 0.0, 1.0));
-    imageStore(uDstY, c10, vec4(ys.y, 0.0, 0.0, 1.0));
-    imageStore(uDstY, c01, vec4(ys.z, 0.0, 0.0, 1.0));
-    imageStore(uDstY, c11, vec4(ys.w, 0.0, 0.0, 1.0));
-    imageStore(uDstUV, ivec2(uvCoord), vec4(cb, cr, 0.0, 1.0));
+    imageStore(uDstY, c00, vec4(float(ys.x), 0.0, 0.0, 1.0));
+    imageStore(uDstY, c10, vec4(float(ys.y), 0.0, 0.0, 1.0));
+    imageStore(uDstY, c01, vec4(float(ys.z), 0.0, 0.0, 1.0));
+    imageStore(uDstY, c11, vec4(float(ys.w), 0.0, 0.0, 1.0));
+    imageStore(uDstUV, ivec2(uvCoord), vec4(float(cb), float(cr), 0.0, 1.0));
 }

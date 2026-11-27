@@ -100,7 +100,7 @@ public:
         VkImage img = VK_NULL_HANDLE;
         VkDeviceMemory mem = VK_NULL_HANDLE;
     };
-    std::expected<TestDmaBuf, std::string> create_test_dmabuf(uint32_t width, uint32_t height, uint32_t frame_idx, bool is_cursor = false);
+    std::expected<TestDmaBuf, std::string> create_test_dmabuf(uint32_t width, uint32_t height, uint32_t frame_idx, bool is_cursor = false, bool is_fp16 = false);
     void destroy_test_dmabuf(TestDmaBuf &buf);
 
 private:

@@ -2,10 +2,17 @@
 
 #include <array>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <unistd.h>
 
 namespace vkcap {
+
+/// Shared mutex to serialize terminal status/log output across capture, encode, and replay-save threads.
+inline std::mutex &stderr_mutex() noexcept {
+    static std::mutex mtx;
+    return mtx;
+}
 
 struct DmaBufPlane {
     int fd = -1;
@@ -30,10 +37,15 @@ struct KmsSurface {
     uint32_t height = 0;
     uint64_t drm_modifier = 0;
     bool has_modifier = false;
+    bool owns_fds = true;         // False for borrowed cached FDs (e.g. cursor cache hit)
     uint32_t num_planes = 0;
     std::array<DmaBufPlane, 4> planes{};
 
     void close_fds() noexcept {
+        if (!owns_fds) {
+            for (uint32_t i = 0; i < num_planes; ++i) planes[i].fd = -1;
+            return;
+        }
         for (uint32_t i = 0; i < num_planes; ++i) {
             if (planes[i].fd >= 0) {
                 int fd = planes[i].fd;
@@ -58,6 +70,7 @@ struct KmsCursor {
 
 struct KmsFrame {
     KmsSurface primary{};
+    CropRect plane_src{};  // Optional DRM primary plane SRC_X/Y/W/H sub-rectangle (e.g. unified multi-monitor FB)
     CropRect crop{};
     KmsCursor cursor{};
 
@@ -69,19 +82,24 @@ struct KmsFrame {
     KmsFrame(const KmsFrame &) = delete;
     KmsFrame &operator=(const KmsFrame &) = delete;
     KmsFrame(KmsFrame &&other) noexcept
-        : primary(other.primary), crop(other.crop), cursor(other.cursor) {
+        : primary(other.primary), plane_src(other.plane_src), crop(other.crop), cursor(other.cursor) {
         for (auto &p : other.primary.planes) p.fd = -1;
         for (auto &p : other.cursor.surface.planes) p.fd = -1;
+        other.primary.owns_fds = false;
+        other.cursor.surface.owns_fds = false;
     }
     KmsFrame &operator=(KmsFrame &&other) noexcept {
         if (this != &other) {
             primary.close_fds();
             cursor.surface.close_fds();
             primary = other.primary;
+            plane_src = other.plane_src;
             crop = other.crop;
             cursor = other.cursor;
             for (auto &p : other.primary.planes) p.fd = -1;
             for (auto &p : other.cursor.surface.planes) p.fd = -1;
+            other.primary.owns_fds = false;
+            other.cursor.surface.owns_fds = false;
         }
         return *this;
     }

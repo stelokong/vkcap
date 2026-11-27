@@ -81,8 +81,17 @@ struct CaptureStream {
     pw_stream *stream = nullptr;
     spa_hook listener{};
     AdaptiveAudioBuffer ring;
-    uint32_t channels = 2;
+    std::atomic<uint32_t> channels{2};
 };
+
+void on_stream_param_changed(void *userdata, uint32_t id, const spa_pod *param) {
+    if (!param || id != SPA_PARAM_Format) return;
+    auto *cs = static_cast<CaptureStream *>(userdata);
+    spa_audio_info_raw info{};
+    if (spa_format_audio_raw_parse(param, &info) >= 0 && info.channels > 0) {
+        cs->channels.store(info.channels, std::memory_order_release);
+    }
+}
 
 void on_stream_process(void *userdata) {
     auto *cs = static_cast<CaptureStream *>(userdata);
@@ -93,25 +102,50 @@ void on_stream_process(void *userdata) {
     if (buf->n_datas > 0 && buf->datas[0].data != nullptr && buf->datas[0].chunk != nullptr) {
         const auto *chunk = buf->datas[0].chunk;
         if ((chunk->flags & SPA_CHUNK_FLAG_CORRUPTED) == 0 && chunk->size > 0) {
-            const auto *base = static_cast<const uint8_t *>(buf->datas[0].data) + chunk->offset;
-            const auto *samples = reinterpret_cast<const float *>(base);
-            const size_t stride = sizeof(float) * cs->channels;
-            const size_t nframes = chunk->size / stride;
-            if (cs->channels == 2) {
-                cs->ring.push_frames(samples, nframes);
-            } else if (cs->channels == 1) {
-                // Mono Pro-Audio / JACK fallback: duplicate mono -> interleaved stereo on stack (0 allocs)
-                float stereo[512];
-                size_t pos = 0;
-                while (pos < nframes) {
-                    const size_t chunk_n = std::min<size_t>(256, nframes - pos);
-                    for (size_t i = 0; i < chunk_n; ++i) {
-                        const float s = samples[pos + i];
-                        stereo[i * 2] = s;
-                        stereo[i * 2 + 1] = s;
+            const uint32_t ch = cs->channels.load(std::memory_order_acquire);
+            if (ch > 0) {
+                const auto *base = static_cast<const uint8_t *>(buf->datas[0].data) + chunk->offset;
+                const auto *samples = reinterpret_cast<const float *>(base);
+                const size_t stride = sizeof(float) * static_cast<size_t>(ch);
+                const size_t nframes = chunk->size / stride;
+                if (ch == 2) {
+                    cs->ring.push_frames(samples, nframes);
+                } else if (ch == 1) {
+                    // Mono USB/XLR/Pro-Audio fallback: duplicate mono -> interleaved stereo on stack (0 allocs)
+                    float stereo[512];
+                    size_t pos = 0;
+                    while (pos < nframes) {
+                        const size_t chunk_n = std::min<size_t>(256, nframes - pos);
+                        for (size_t i = 0; i < chunk_n; ++i) {
+                            const float s = samples[pos + i];
+                            stereo[i * 2] = s;
+                            stereo[i * 2 + 1] = s;
+                        }
+                        cs->ring.push_frames(stereo, chunk_n);
+                        pos += chunk_n;
                     }
-                    cs->ring.push_frames(stereo, chunk_n);
-                    pos += chunk_n;
+                } else {
+                    // Multi-channel (>2ch) downmix on stack (0 allocs): standard SMPTE 5.1/7.1 fold
+                    // when ch >= 6 (FL=0, FR=1, FC=2, LFE=3, RL/SL=4, RR/SR=5), else take channels 0/1.
+                    float stereo[512];
+                    size_t pos = 0;
+                    while (pos < nframes) {
+                        const size_t chunk_n = std::min<size_t>(256, nframes - pos);
+                        for (size_t i = 0; i < chunk_n; ++i) {
+                            const float *f = samples + (pos + i) * ch;
+                            float l = f[0];
+                            float r = f[1];
+                            if (ch >= 6) {
+                                const float c = 0.70710678f * f[2];
+                                l = (l + c + 0.5f * f[4]) * 0.7f;
+                                r = (r + c + 0.5f * f[5]) * 0.7f;
+                            }
+                            stereo[i * 2] = l;
+                            stereo[i * 2 + 1] = r;
+                        }
+                        cs->ring.push_frames(stereo, chunk_n);
+                        pos += chunk_n;
+                    }
                 }
             }
         }
@@ -122,6 +156,7 @@ void on_stream_process(void *userdata) {
 const pw_stream_events kStreamEvents = [] {
     pw_stream_events ev{};
     ev.version = PW_VERSION_STREAM_EVENTS;
+    ev.param_changed = on_stream_param_changed;
     ev.process = on_stream_process;
     return ev;
 }();
@@ -311,7 +346,7 @@ std::expected<std::unique_ptr<AudioCapture>, std::string> AudioCapture::start(co
     auto connect_stream = [&](const char *stream_name, pw_properties *props,
                               std::unique_ptr<CaptureStream> &out_cs) -> std::expected<void, std::string> {
         auto cs = std::make_unique<CaptureStream>();
-        cs->channels = cfg.channels;
+        cs->channels.store(cfg.channels, std::memory_order_relaxed);
         cs->stream = pw_stream_new(impl->core, stream_name, props);
         if (!cs->stream) {
             return std::unexpected(std::format("pw_stream_new({}) failed", stream_name));
@@ -389,6 +424,11 @@ std::expected<std::unique_ptr<AudioCapture>, std::string> AudioCapture::start(co
 void AudioCapture::reset_sync() noexcept {
     if (impl_->sys_stream) impl_->sys_stream->ring.reset();
     if (impl_->mic_stream) impl_->mic_stream->ring.reset();
+}
+
+void AudioCapture::resume_sync() noexcept {
+    if (impl_->sys_stream) impl_->sys_stream->ring.trim_to_cushion();
+    if (impl_->mic_stream) impl_->mic_stream->ring.trim_to_cushion();
 }
 
 void AudioCapture::read_mixed_frames(float *dst, size_t nb_frames) noexcept {

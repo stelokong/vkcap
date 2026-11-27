@@ -212,7 +212,13 @@ struct KmsCapture::Impl {
     KmsDisplayInfo display{};
     int drm_fd = -1;
 
-    // Cached atomic property IDs for cursor plane so per-frame cursor queries are minimal
+    // Cached atomic property IDs for primary & cursor planes so per-frame queries are single-ioctl
+    uint32_t prop_primary_fb = 0;
+    uint32_t prop_primary_src_x = 0;
+    uint32_t prop_primary_src_y = 0;
+    uint32_t prop_primary_src_w = 0;
+    uint32_t prop_primary_src_h = 0;
+
     uint32_t prop_cursor_fb = 0;
     uint32_t prop_cursor_x = 0;
     uint32_t prop_cursor_y = 0;
@@ -227,6 +233,10 @@ struct KmsCapture::Impl {
     // Last-grab state for zero-ioctl duplicate-frame detection when CRTC vblank has not advanced
     uint64_t last_vblank_seq = 0;
     uint32_t last_primary_fb_id = 0;
+    uint32_t last_primary_src_x = 0;
+    uint32_t last_primary_src_y = 0;
+    uint32_t last_primary_src_w = 0;
+    uint32_t last_primary_src_h = 0;
     uint32_t last_cursor_fb_id = 0;
     int32_t last_cursor_x = 0;
     int32_t last_cursor_y = 0;
@@ -383,6 +393,24 @@ std::expected<std::unique_ptr<KmsCapture>, std::string> KmsCapture::open(const C
     drmSetClientCap(impl->drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
     drmSetClientCap(impl->drm_fd, DRM_CLIENT_CAP_ATOMIC, 1);
 
+    if (impl->display.primary_plane_id != 0) {
+        drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(
+            impl->drm_fd, impl->display.primary_plane_id, DRM_MODE_OBJECT_PLANE);
+        if (props) {
+            for (uint32_t i = 0; i < props->count_props; ++i) {
+                drmModePropertyPtr p = drmModeGetProperty(impl->drm_fd, props->props[i]);
+                if (!p) continue;
+                if (std::strcmp(p->name, "FB_ID") == 0) impl->prop_primary_fb = props->props[i];
+                else if (std::strcmp(p->name, "SRC_X") == 0) impl->prop_primary_src_x = props->props[i];
+                else if (std::strcmp(p->name, "SRC_Y") == 0) impl->prop_primary_src_y = props->props[i];
+                else if (std::strcmp(p->name, "SRC_W") == 0) impl->prop_primary_src_w = props->props[i];
+                else if (std::strcmp(p->name, "SRC_H") == 0) impl->prop_primary_src_h = props->props[i];
+                drmModeFreeProperty(p);
+            }
+            drmModeFreeObjectProperties(props);
+        }
+    }
+
     if (impl->display.cursor_plane_id != 0) {
         drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(
             impl->drm_fd, impl->display.cursor_plane_id, DRM_MODE_OBJECT_PLANE);
@@ -419,9 +447,45 @@ std::expected<KmsFrame, std::string> KmsCapture::grab_frame() {
 
 std::expected<KmsFrame, std::string> KmsCapture::grab_frame_dedup(uint64_t vblank_seq, bool &out_unchanged) {
     out_unchanged = false;
-    // 1. Query primary plane FB_ID via direct stack ioctl (0 heap allocations, 1 ioctl)
+    // 1. Query primary plane FB_ID + SRC_X/Y/W/H via single stack ioctl (0 heap allocations)
     uint32_t fb_id = 0;
-    if (impl_->display.primary_plane_id != 0) {
+    uint32_t p_src_x = 0, p_src_y = 0, p_src_w = 0, p_src_h = 0;
+    if (impl_->display.primary_plane_id != 0 && impl_->prop_primary_fb != 0) {
+        uint32_t prop_ids[64]{};
+        uint64_t prop_vals[64]{};
+        drm_mode_obj_get_properties req{};
+        req.obj_id = impl_->display.primary_plane_id;
+        req.obj_type = DRM_MODE_OBJECT_PLANE;
+        req.count_props = 64;
+        req.props_ptr = reinterpret_cast<uintptr_t>(prop_ids);
+        req.prop_values_ptr = reinterpret_cast<uintptr_t>(prop_vals);
+        auto scan_prim = [&](const uint32_t *ids, const uint64_t *vals, uint32_t n) {
+            for (uint32_t i = 0; i < n; ++i) {
+                const uint32_t id = ids[i];
+                const uint64_t val = vals[i];
+                if (id == impl_->prop_primary_fb) fb_id = static_cast<uint32_t>(val);
+                else if (id == impl_->prop_primary_src_x) p_src_x = static_cast<uint32_t>(val >> 16);
+                else if (id == impl_->prop_primary_src_y) p_src_y = static_cast<uint32_t>(val >> 16);
+                else if (id == impl_->prop_primary_src_w) p_src_w = static_cast<uint32_t>(val >> 16);
+                else if (id == impl_->prop_primary_src_h) p_src_h = static_cast<uint32_t>(val >> 16);
+            }
+        };
+        if (::ioctl(impl_->drm_fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &req) == 0) {
+            if (req.count_props <= 64u) {
+                scan_prim(prop_ids, prop_vals, req.count_props);
+            } else {
+                std::vector<uint32_t> dyn_ids(req.count_props);
+                std::vector<uint64_t> dyn_vals(req.count_props);
+                req.props_ptr = reinterpret_cast<uintptr_t>(dyn_ids.data());
+                req.prop_values_ptr = reinterpret_cast<uintptr_t>(dyn_vals.data());
+                if (::ioctl(impl_->drm_fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &req) == 0) {
+                    scan_prim(dyn_ids.data(), dyn_vals.data(),
+                              std::min<uint32_t>(req.count_props, static_cast<uint32_t>(dyn_ids.size())));
+                }
+            }
+        }
+    }
+    if (fb_id == 0 && impl_->display.primary_plane_id != 0) {
         drm_mode_get_plane pl{};
         pl.plane_id = impl_->display.primary_plane_id;
         if (::ioctl(impl_->drm_fd, DRM_IOCTL_MODE_GETPLANE, &pl) == 0) {
@@ -433,6 +497,12 @@ std::expected<KmsFrame, std::string> KmsCapture::grab_frame_dedup(uint64_t vblan
         crtc.crtc_id = impl_->display.crtc_id;
         if (::ioctl(impl_->drm_fd, DRM_IOCTL_MODE_GETCRTC, &crtc) == 0) {
             fb_id = crtc.fb_id;
+            if (p_src_w == 0 && p_src_h == 0 && crtc.mode_valid) {
+                p_src_x = crtc.x;
+                p_src_y = crtc.y;
+                p_src_w = crtc.mode.hdisplay;
+                p_src_h = crtc.mode.vdisplay;
+            }
         }
     }
     if (fb_id == 0) {
@@ -480,10 +550,14 @@ std::expected<KmsFrame, std::string> KmsCapture::grab_frame_dedup(uint64_t vblan
     }
 
     // Zero-ioctl duplicate-frame fast-path: if the CRTC vblank sequence has not advanced since
-    // our last grab AND primary fb_id + cursor state are identical, no scanout flip occurred.
+    // our last grab AND primary fb_id + plane rect + cursor state are identical, no scanout flip occurred.
     if (vblank_seq != 0 &&
         vblank_seq == impl_->last_vblank_seq &&
         fb_id == impl_->last_primary_fb_id &&
+        p_src_x == impl_->last_primary_src_x &&
+        p_src_y == impl_->last_primary_src_y &&
+        p_src_w == impl_->last_primary_src_w &&
+        p_src_h == impl_->last_primary_src_h &&
         c_fb == impl_->last_cursor_fb_id &&
         cx == impl_->last_cursor_x &&
         cy == impl_->last_cursor_y &&
@@ -495,6 +569,7 @@ std::expected<KmsFrame, std::string> KmsCapture::grab_frame_dedup(uint64_t vblan
 
     auto dup_surface = [](const KmsSurface &src) -> std::optional<KmsSurface> {
         KmsSurface dst = src;
+        dst.owns_fds = true;
         for (uint32_t i = 0; i < dst.num_planes; ++i) dst.planes[i].fd = -1;
         for (uint32_t i = 0; i < src.num_planes; ++i) {
             if (src.planes[i].fd < 0) continue;
@@ -565,18 +640,45 @@ std::expected<KmsFrame, std::string> KmsCapture::grab_frame_dedup(uint64_t vblan
 
     if (cursor_cache_hit) {
         ++impl_->cached_cursor_age;
-        if (auto duped = dup_surface(impl_->cached_cursor_surface)) {
-            frame.cursor.visible = true;
-            frame.cursor.x = cx;
-            frame.cursor.y = cy;
-            frame.cursor.width = static_cast<int32_t>(cw);
-            frame.cursor.height = static_cast<int32_t>(ch);
-            frame.cursor.surface = *duped;
+        // Borrow cached cursor FDs directly (0 fcntl/close syscalls per frame; VulkanCompute
+        // only reads inode_key on cache hit and dups on miss; cached_cursor_surface outlives frame).
+        frame.cursor.visible = true;
+        frame.cursor.x = cx;
+        frame.cursor.y = cy;
+        frame.cursor.width = static_cast<int32_t>(cw);
+        frame.cursor.height = static_cast<int32_t>(ch);
+        frame.cursor.surface = impl_->cached_cursor_surface;
+        frame.cursor.surface.owns_fds = false;
+    }
+
+    // Honor DRM primary plane SRC_X/Y/W/H for unified multi-monitor framebuffers (common on X11)
+    if (p_src_w >= 2 && p_src_h >= 2 &&
+        p_src_x < frame.primary.width && p_src_y < frame.primary.height) {
+        const uint32_t clamped_w = std::min(p_src_w, frame.primary.width - p_src_x);
+        const uint32_t clamped_h = std::min(p_src_h, frame.primary.height - p_src_y);
+        if (clamped_w >= 2 && clamped_h >= 2 &&
+            (p_src_x != 0 || p_src_y != 0 ||
+             clamped_w != frame.primary.width || clamped_h != frame.primary.height)) {
+            frame.plane_src = {
+                static_cast<int32_t>(p_src_x),
+                static_cast<int32_t>(p_src_y),
+                static_cast<int32_t>(clamped_w),
+                static_cast<int32_t>(clamped_h),
+            };
+            // Cursor CRTC_X/Y are display-local; shift into source framebuffer coordinates
+            if (frame.cursor.visible) {
+                frame.cursor.x += frame.plane_src.x;
+                frame.cursor.y += frame.plane_src.y;
+            }
         }
     }
 
     impl_->last_vblank_seq = vblank_seq;
     impl_->last_primary_fb_id = fb_id;
+    impl_->last_primary_src_x = p_src_x;
+    impl_->last_primary_src_y = p_src_y;
+    impl_->last_primary_src_w = p_src_w;
+    impl_->last_primary_src_h = p_src_h;
     impl_->last_cursor_fb_id = c_fb;
     impl_->last_cursor_x = cx;
     impl_->last_cursor_y = cy;

@@ -194,8 +194,12 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
     {
         auto probe_res = kms->grab_frame();
         if (!probe_res) return std::unexpected(probe_res.error());
-        src_w = probe_res->primary.width;
-        src_h = probe_res->primary.height;
+        src_w = probe_res->plane_src.valid()
+            ? static_cast<uint32_t>(probe_res->plane_src.width)
+            : probe_res->primary.width;
+        src_h = probe_res->plane_src.valid()
+            ? static_cast<uint32_t>(probe_res->plane_src.height)
+            : probe_res->primary.height;
     }
 
     CropRect eff_crop{};
@@ -350,6 +354,9 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
             vcodec_str, cfg.pixfmt == PixelFormat::P010 ? "10-bit P010" : "8-bit NV12",
             cfg.fps, crop_str, cfg.capture_cursor ? ", hw-cursor" : "",
             gamut.description, audio_desc);
+        if (::isatty(STDIN_FILENO) != 0) {
+            std::cerr << "[vkcap] Press 'p' to pause/resume, 'q' or Ctrl+C to stop.\n";
+        }
     }
 
     EncodeFrameQueue encode_queue(cfg.queue_size, vk.get());
@@ -399,6 +406,7 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
                     : 0.0;
                 if (encoder->replay_mode()) {
                     auto rst = encoder->replay_stats();
+                    std::lock_guard log_lk(stderr_mutex());
                     std::cerr << std::format(
                         "\r[vkcap] REPLAY | {:.1f} fps | buf {:.1f}s ({:.1f} MiB) | saved {} | compute {:.2f} ms/f   ",
                         inst_fps, rst.buffered_sec,
@@ -414,6 +422,7 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
                         ? std::format("{}:{:02d}:{:02d}", hrs, mins, secs)
                         : std::format("{:02d}:{:02d}", mins, secs);
                     const double mib = static_cast<double>(est.bytes_written) / (1024.0 * 1024.0);
+                    std::lock_guard log_lk(stderr_mutex());
                     std::cerr << std::format(
                         "\r[vkcap] {} | {:.1f} fps | {} frames | {} dropped | {:.2f} Mbps ({:.1f} MiB) | compute {:.2f} ms/f   ",
                         time_str, inst_fps, est.frames_submitted, encode_queue.dropped(), mbps, mib, avg_comp_ms)
@@ -505,14 +514,16 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
     };
     auto apply_clamped_crop = [&](KmsFrame &kf) {
         if (!eff_crop.valid()) return;
-        const int32_t pw = static_cast<int32_t>(kf.primary.width);
-        const int32_t ph = static_cast<int32_t>(kf.primary.height);
-        if (eff_crop.x < pw && eff_crop.y < ph) {
+        const int32_t base_x = kf.plane_src.valid() ? kf.plane_src.x : 0;
+        const int32_t base_y = kf.plane_src.valid() ? kf.plane_src.y : 0;
+        const int32_t base_w = kf.plane_src.valid() ? kf.plane_src.width : static_cast<int32_t>(kf.primary.width);
+        const int32_t base_h = kf.plane_src.valid() ? kf.plane_src.height : static_cast<int32_t>(kf.primary.height);
+        if (eff_crop.x < base_w && eff_crop.y < base_h) {
             CropRect c{};
-            c.x = eff_crop.x;
-            c.y = eff_crop.y;
-            c.width = std::min(eff_crop.width, pw - c.x);
-            c.height = std::min(eff_crop.height, ph - c.y);
+            c.x = base_x + eff_crop.x;
+            c.y = base_y + eff_crop.y;
+            c.width = std::min(eff_crop.width, base_w - eff_crop.x);
+            c.height = std::min(eff_crop.height, base_h - eff_crop.y);
             if (c.width >= 2 && c.height >= 2) kf.crop = c;
         }
     };
@@ -536,7 +547,7 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
         }
     }
 
-    ScopedRawKeyReader key_reader(encoder->replay_mode());
+    ScopedRawKeyReader key_reader(true);
     const int64_t end_ns = (cfg.duration_sec > 0.0)
         ? (base_ns + static_cast<int64_t>(cfg.duration_sec * 1e9))
         : 0;
@@ -549,10 +560,10 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
     uint64_t wake_samples = 0;
 
     while (!stop_flag.load(std::memory_order_acquire)) {
-        // Check non-blocking terminal keypresses in instant-replay mode (~6 Hz, zero overhead)
+        // Check non-blocking terminal keypresses (~6 Hz, zero overhead; active on any TTY)
         if (key_reader.active && (frame_idx % 10) == 0) {
             const char ch = key_reader.poll_key();
-            if (ch == 's' || ch == 'S' || ch == '\n' || ch == ' ') {
+            if (encoder->replay_mode() && (ch == 's' || ch == 'S' || ch == '\n' || ch == ' ')) {
                 signals.save_replay.store(true, std::memory_order_release);
             } else if (ch == 'p' || ch == 'P') {
                 bool cur = signals.paused.load(std::memory_order_relaxed);
@@ -566,6 +577,7 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
         // Trigger zero-copy async replay save on SIGUSR2 or keypress
         if (encoder->replay_mode() && signals.save_replay.exchange(false, std::memory_order_acq_rel)) {
             auto sres = encoder->save_replay_async();
+            std::lock_guard log_lk(stderr_mutex());
             if (!sres) {
                 std::cerr << "\n[vkcap] Replay save skipped: " << sres.error() << '\n' << std::flush;
             } else {
@@ -573,13 +585,29 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
             }
         }
 
-        // Handle SIGUSR1 pause/resume cleanly while preserving continuous A/V timestamps
+        // Handle SIGUSR1 / 'p' pause/resume cleanly while preserving continuous A/V timestamps
         if (signals.paused.load(std::memory_order_acquire)) {
             pause_updating.store(true, std::memory_order_release);
             const int64_t p_start = monotonic_now_ns();
-            std::cerr << "\n[vkcap] Paused (send SIGUSR1 to resume)...\n" << std::flush;
+            {
+                std::lock_guard log_lk(stderr_mutex());
+                std::cerr << (key_reader.active
+                    ? "\n[vkcap] Paused (press 'p' or send SIGUSR1 to resume, 'q'/Ctrl+C to stop)...\n"
+                    : "\n[vkcap] Paused (send SIGUSR1 to resume)...\n")
+                          << std::flush;
+            }
             while (signals.paused.load(std::memory_order_acquire) &&
                    !stop_flag.load(std::memory_order_acquire)) {
+                if (key_reader.active) {
+                    const char ch = key_reader.poll_key();
+                    if (ch == 'p' || ch == 'P') {
+                        signals.paused.store(false, std::memory_order_release);
+                        break;
+                    } else if (ch == 'q' || ch == 'Q') {
+                        stop_flag.store(true, std::memory_order_release);
+                        break;
+                    }
+                }
                 sleep_until_monotonic_ns(monotonic_now_ns() + 15'000'000LL, stop_flag);
             }
             if (stop_flag.load(std::memory_order_acquire)) {
@@ -589,11 +617,14 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
             const int64_t p_dur = monotonic_now_ns() - p_start;
             pause_offset_ns.fetch_add(p_dur, std::memory_order_release);
             if (last_submitted_frame) av_frame_free(&last_submitted_frame);
-            if (audio) audio->reset_sync();
+            if (audio) audio->resume_sync();
             pacer.on_resume();
-            // Release audio thread only after pause_offset_ns and audio->reset_sync() are committed
+            // Release audio thread only after pause_offset_ns and audio->resume_sync() are committed
             pause_updating.store(false, std::memory_order_release);
-            std::cerr << "[vkcap] Resumed.\n" << std::flush;
+            {
+                std::lock_guard log_lk(stderr_mutex());
+                std::cerr << "[vkcap] Resumed.\n" << std::flush;
+            }
             continue;
         }
 
@@ -632,14 +663,23 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
         bool unchanged = false;
         auto frame_res = kms->grab_frame_dedup(cur_vb_seq, unchanged);
         if (!frame_res) {
-            // Brief transient miss during mode-set / fullscreen transition: refresh mode Hz & skip tick
+            // Brief transient miss during mode-set / fullscreen transition: refresh mode Hz
+            // and clone the last frame to preserve strict CFR continuity (zero PTS gaps).
             if (cfg.verbose) {
+                std::lock_guard log_lk(stderr_mutex());
                 std::cerr << "\n[kms] transient grab miss: " << frame_res.error() << '\n';
             }
             if (auto hz = kms->query_refresh_hz()) {
                 pacer.update_refresh_hz(*hz);
             }
             ++kms_misses;
+            if (last_submitted_frame) {
+                if (AVFrame *dup = av_frame_clone(last_submitted_frame)) {
+                    ++dup_reused;
+                    encode_queue.push(dup, frame_idx++, kNoComputeSlot);
+                    continue;
+                }
+            }
             frame_idx++;
             continue;
         }
@@ -654,9 +694,15 @@ std::expected<void, std::string> run_kms_pipeline(const Config &in_cfg, Pipeline
         }
 
         // Detect mid-recording fullscreen modeset / resolution change and adapt pacer refresh rate
-        if (frame_res->primary.width != last_src_w || frame_res->primary.height != last_src_h) {
-            last_src_w = frame_res->primary.width;
-            last_src_h = frame_res->primary.height;
+        const uint32_t cur_src_w = frame_res->plane_src.valid()
+            ? static_cast<uint32_t>(frame_res->plane_src.width)
+            : frame_res->primary.width;
+        const uint32_t cur_src_h = frame_res->plane_src.valid()
+            ? static_cast<uint32_t>(frame_res->plane_src.height)
+            : frame_res->primary.height;
+        if (cur_src_w != last_src_w || cur_src_h != last_src_h) {
+            last_src_w = cur_src_w;
+            last_src_h = cur_src_h;
             if (auto hz = kms->query_refresh_hz()) {
                 pacer.update_refresh_hz(*hz);
             }

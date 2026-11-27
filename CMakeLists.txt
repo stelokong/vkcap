@@ -24,15 +24,15 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
 set(GENERATED_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/shaders")
 file(MAKE_DIRECTORY "${GENERATED_SHADER_DIR}")
 
-function(add_embedded_shader SHADER_SRC VARIANT_NAME DEFINE_FLAG SYMBOL_NAME OUT_HEADER)
+function(add_embedded_shader SHADER_SRC VARIANT_NAME DEFINE_FLAGS SYMBOL_NAME OUT_HEADER)
     set(SPV_FILE "${GENERATED_SHADER_DIR}/${VARIANT_NAME}.spv")
     set(HDR_FILE "${GENERATED_SHADER_DIR}/${VARIANT_NAME}_spv.hpp")
 
     add_custom_command(
         OUTPUT "${SPV_FILE}"
-        COMMAND "${GLSLC_EXECUTABLE}" --target-env=vulkan1.3 -O "${DEFINE_FLAG}" "${SHADER_SRC}" -o "${SPV_FILE}"
+        COMMAND "${GLSLC_EXECUTABLE}" --target-env=vulkan1.3 -O ${DEFINE_FLAGS} "${SHADER_SRC}" -o "${SPV_FILE}"
         DEPENDS "${SHADER_SRC}"
-        COMMENT "Compiling shader ${VARIANT_NAME}.spv (${DEFINE_FLAG})"
+        COMMENT "Compiling shader ${VARIANT_NAME}.spv (${DEFINE_FLAGS})"
         VERBATIM
     )
 
@@ -51,15 +51,23 @@ endfunction()
 add_embedded_shader(
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rgb_to_yuv.comp"
     "rgb_to_yuv_nv12"
-    "-DP010=0"
+    "-DP010=0;-DUSE_FP16=0"
     "kRgbToYuvNv12Spv"
     RGB_TO_YUV_NV12_HEADER
 )
 
 add_embedded_shader(
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rgb_to_yuv.comp"
+    "rgb_to_yuv_nv12_fp16"
+    "-DP010=0;-DUSE_FP16=1"
+    "kRgbToYuvNv12Fp16Spv"
+    RGB_TO_YUV_NV12_FP16_HEADER
+)
+
+add_embedded_shader(
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rgb_to_yuv.comp"
     "rgb_to_yuv_p010"
-    "-DP010=1"
+    "-DP010=1;-DUSE_FP16=0"
     "kRgbToYuvP010Spv"
     RGB_TO_YUV_P010_HEADER
 )
@@ -76,6 +84,7 @@ add_library(vkcap_core STATIC
     src/video_encoder.cpp
     src/pipeline.cpp
     "${RGB_TO_YUV_NV12_HEADER}"
+    "${RGB_TO_YUV_NV12_FP16_HEADER}"
     "${RGB_TO_YUV_P010_HEADER}"
 )
 

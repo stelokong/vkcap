@@ -50,7 +50,7 @@ public:
     explicit AdaptiveAudioBuffer(size_t target_cushion_frames = kDefaultTargetCushion) noexcept
         : target_cushion_(target_cushion_frames) {}
 
-    /// Discards buffered samples and resets resampler state (call on recording start / resume).
+    /// Discards buffered samples and resets resampler state (call on recording start).
     void reset() noexcept {
         const uint64_t w = write_pos_.load(std::memory_order_acquire);
         read_pos_.store(w, std::memory_order_release);
@@ -64,6 +64,25 @@ public:
         fade_in_rem_ = 0;
         h_ = {};
         ratio_ppm_.store(0, std::memory_order_relaxed);
+    }
+
+    /// Trims buffered audio to the latest `target_cushion_` frames on pause->resume so
+    /// playback resumes immediately with a click-free 1.33 ms fade-in and zero silence gap.
+    void trim_to_cushion() noexcept {
+        const uint64_t w = write_pos_.load(std::memory_order_acquire);
+        const uint64_t r = read_pos_.load(std::memory_order_relaxed);
+        const uint64_t avail = (w >= r) ? (w - r) : 0;
+        if (avail >= target_cushion_) {
+            read_pos_.store(w - target_cushion_, std::memory_order_release);
+            primed_ = false;
+            was_idle_ = false;
+            frac_ = 0.0;
+            err_ema_ = 0.0;
+            err_ema2_ = 0.0;
+            h_ = {};
+        } else {
+            reset();
+        }
     }
 
     size_t available_frames() const noexcept {
@@ -133,7 +152,9 @@ public:
 
         const uint64_t desired_pre_pop = static_cast<uint64_t>(nb_frames + target_cushion_);
         const uint64_t hard_max_backlog = static_cast<uint64_t>(nb_frames + target_cushion_ * 4);
-        const uint64_t min_start_frames = static_cast<uint64_t>(nb_frames + (target_cushion_ * 3) / 4);
+        // Half-cushion start gate (1984 frames @ 960+2048) lets 2048-quantum PipeWire graphs
+        // start cleanly on packet 0 with 0 ms A/V offset while keeping >20 ms underrun headroom.
+        const uint64_t min_start_frames = static_cast<uint64_t>(nb_frames + target_cushion_ / 2);
 
         if (was_idle_) {
             // Wait until the jitter cushion has filled before starting playback so we never
@@ -322,6 +343,9 @@ public:
 
     /// Resets ring buffers and PI resamplers to synchronize sample 0 with the video start timestamp.
     void reset_sync() noexcept;
+
+    /// Trims ring buffers to the live jitter cushion on pause->resume for zero-dropout resumption.
+    void resume_sync() noexcept;
 
     /// Reads exactly `nb_frames` interleaved stereo float32 frames (2 * nb_frames floats)
     /// into `dst`, independently drift-resampling and mixing system audio + microphone

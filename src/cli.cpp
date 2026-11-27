@@ -214,7 +214,9 @@ std::expected<void, std::string> apply_profile_impl(
     const CodecEncodeCaps &cc = target.caps_for(eff_c);
     const bool supports_10bit = cc.supports_10bit && (eff_c == Codec::Av1 || eff_c == Codec::Hevc);
     const int max_q = static_cast<int>(std::max<uint32_t>(1u, cc.max_quality_levels)) - 1;
-    const int std_q = std::min(1, max_q);
+    const int std_q = (max_q <= 1) ? max_q : std::max(1, (max_q + 1) / 2);
+    const int fast_hq = std::min(1, max_q);
+    const int b_rec = cc.supports_b_frames ? 2 : 1;
     const uint32_t std_fps = forced_fps ? *forced_fps : recommended_standard_fps(target.refresh_hz);
     const uint32_t gp_fps = forced_fps ? *forced_fps : recommended_gameplay_fps(target.refresh_hz);
 
@@ -230,7 +232,7 @@ std::expected<void, std::string> apply_profile_impl(
         cfg.content = Content::Rendered;
         cfg.idr_interval = 0;
         cfg.async_depth = 4;
-        cfg.b_depth = 1;
+        cfg.b_depth = b_rec;
         cfg.dither = (cfg.pixfmt == PixelFormat::Nv12);
         return {};
     }
@@ -240,7 +242,7 @@ std::expected<void, std::string> apply_profile_impl(
         cfg.codec = eff_c;
         cfg.pixfmt = forced_pixfmt ? *forced_pixfmt : PixelFormat::Nv12;
         apply_vbr_or_fallback(cfg, target, cc, 20.8, 1.57, 56, 24);
-        cfg.quality = std_q;
+        cfg.quality = fast_hq;
         cfg.tune = Tune::Hq;
         cfg.usage = Usage::Record;
         cfg.content = Content::Rendered;
@@ -256,7 +258,7 @@ std::expected<void, std::string> apply_profile_impl(
         cfg.codec = eff_c;
         cfg.pixfmt = forced_pixfmt ? *forced_pixfmt : (supports_10bit ? PixelFormat::P010 : PixelFormat::Nv12);
         apply_vbr_or_fallback(cfg, target, cc, 23.8, 1.50, 52, 22);
-        cfg.quality = std_q;
+        cfg.quality = fast_hq;
         cfg.tune = Tune::Hq;
         cfg.usage = Usage::Record;
         cfg.content = Content::Rendered;
@@ -272,13 +274,13 @@ std::expected<void, std::string> apply_profile_impl(
         cfg.codec = eff_c;
         cfg.pixfmt = forced_pixfmt ? *forced_pixfmt : (supports_10bit ? PixelFormat::P010 : PixelFormat::Nv12);
         apply_cqp_or_fallback(cfg, target, cc, 36, 18, 45.0);
-        cfg.quality = std_q;
+        cfg.quality = max_q;
         cfg.tune = Tune::Hq;
         cfg.usage = Usage::Record;
         cfg.content = Content::Rendered;
         cfg.idr_interval = 0;
         cfg.async_depth = 4;
-        cfg.b_depth = 1;
+        cfg.b_depth = b_rec;
         cfg.dither = (cfg.pixfmt == PixelFormat::Nv12);
         return {};
     }
@@ -294,7 +296,7 @@ std::expected<void, std::string> apply_profile_impl(
         cfg.content = Content::Rendered;
         cfg.idr_interval = static_cast<int>(cfg.fps * 4u);  // 4-second GOP
         cfg.async_depth = 4;
-        cfg.b_depth = 1;
+        cfg.b_depth = b_rec;
         cfg.dither = (cfg.pixfmt == PixelFormat::Nv12);
         return {};
     }
@@ -310,7 +312,7 @@ std::expected<void, std::string> apply_profile_impl(
         cfg.content = Content::Desktop;
         cfg.idr_interval = static_cast<int>(cfg.fps * 4u);  // 4-second GOP
         cfg.async_depth = 4;
-        cfg.b_depth = 1;
+        cfg.b_depth = b_rec;
         cfg.dither = (cfg.pixfmt == PixelFormat::Nv12);
         return {};
     }
@@ -360,6 +362,7 @@ std::expected<void, std::string> adapt_config_to_target(Config &cfg, const Profi
         cfg.dither = adapted.dither;
     }
     if (!cfg.quality_explicit) cfg.quality = adapted.quality;
+    if (!cfg.b_depth_explicit) cfg.b_depth = adapted.b_depth;
 
     if (!cfg.rc_explicit && !cfg.qp_explicit && !cfg.bitrate_explicit) {
         cfg.rc = adapted.rc;
@@ -391,10 +394,12 @@ std::vector<AdaptiveProfileInfo> describe_profiles(const ProfileTarget &target) 
                 : std::format("VBR {}M (max {}M)", c.bitrate / 1'000'000, c.max_bitrate / 1'000'000);
         const char *fmt_desc = (c.pixfmt == PixelFormat::P010) ? "10-bit P010" : "8-bit NV12 + IGN";
         const auto &cc = target.caps_for(c.codec);
-        const int eff_q = (c.quality >= 0) ? c.quality
-            : (static_cast<int>(std::max<uint32_t>(1u, cc.max_quality_levels)) > 1 ? 1 : 0);
+        const int max_q = static_cast<int>(std::max<uint32_t>(1u, cc.max_quality_levels)) - 1;
+        const int auto_q = (max_q <= 1) ? max_q : std::max(1, (max_q + 1) / 2);
+        const int eff_q = (c.quality >= 0) ? c.quality : auto_q;
         std::string extra;
         if (c.idr_interval > 0 && c.idr_interval == static_cast<int>(c.fps * 4u)) extra += " | 4s GOP";
+        if (c.b_depth > 1) extra += std::format(" | B-depth {}", c.b_depth);
         if (c.content == Content::Desktop) extra += " | desktop";
         else if (c.tune == Tune::Ll) extra += std::format(" | quality {} | ll | async {}", eff_q, c.async_depth);
         else extra += std::format(" | quality {} | hq", eff_q);
@@ -910,6 +915,7 @@ std::expected<Config, std::string> parse_args(int argc, char **argv, const Confi
                 auto r = parse_int(optarg, 1, 8, "--b-depth");
                 if (!r) return std::unexpected(r.error());
                 cfg.b_depth = *r;
+                cfg.b_depth_explicit = true;
                 break;
             }
             case OPT_DEVICE: {

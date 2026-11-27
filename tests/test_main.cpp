@@ -394,6 +394,54 @@ void test_cli_and_privileges() {
                 test_skew(-500.0, 960, "AdaptiveAudioBuffer -500ppm (960q) zero underruns/trims");
                 test_skew(+500.0, 1024, "AdaptiveAudioBuffer +500ppm (1024q) zero underruns/trims");
                 test_skew(-500.0, 2048, "AdaptiveAudioBuffer -500ppm (2048q) zero underruns/trims");
+
+                // Pause->resume trim_to_cushion(): immediate live output with 0 ms silence dropout
+                {
+                    AdaptiveAudioBuffer abuf(AdaptiveAudioBuffer::kDefaultTargetCushion);
+                    abuf.reset();
+                    std::vector<float> sig(6000 * 2, 0.4f);
+                    abuf.push_frames(sig.data(), 6000);
+                    abuf.trim_to_cushion();
+                    check(abuf.available_frames() == AdaptiveAudioBuffer::kDefaultTargetCushion,
+                          "trim_to_cushion retains exactly target_cushion frames");
+                    std::vector<float> out_buf(960 * 2, 0.0f);
+                    abuf.pop_resampled(out_buf.data(), 960);
+                    // First sample fades in cleanly, steady-state reaches 0.4f immediately (no 52 ms silence!)
+                    check(out_buf[0] > 0.0f && std::abs(out_buf[200 * 2] - 0.4f) < 0.01f,
+                          "trim_to_cushion resumes immediately with click-free fade-in");
+                }
+            }
+
+            // Adaptive B-frame & quality level scaling + user_config persistence (crop, replay, device_explicit)
+            {
+                ProfileTarget q4_b{};
+                q4_b.av1 = {true, true, true, true, true, 4, 4096, 4096, 0, true};
+                Config cd{}, cg{}, cm{}, cl{};
+                check(apply_profile(cd, "default", q4_b).has_value(), "apply default q4+B");
+                check(cd.b_depth == 2, "default enables b_depth=2 when GPU supports B-frames");
+                check(apply_profile(cg, "gameplay", q4_b).has_value(), "apply gameplay q4+B");
+                check(cg.b_depth == 1 && cg.quality == 1, "gameplay keeps b_depth=1 & fast_hq=1");
+                check(apply_profile(cm, "master", q4_b).has_value(), "apply master q4+B");
+                check(cm.b_depth == 2 && cm.quality == 3, "master uses max_q=3 & b_depth=2");
+                check(apply_profile(cl, "low-latency", q4_b).has_value(), "apply low-latency q4+B");
+                check(cl.b_depth == 1 && cl.quality == 0, "low-latency keeps b_depth=1 & quality=0");
+
+                const std::filesystem::path tmp_u = "/tmp/vkcap_test_user_persist.conf";
+                std::filesystem::remove(tmp_u);
+                Config save_c{};
+                save_c.device_index = 2;
+                save_c.crop = {100, 50, 1280, 720};
+                save_c.replay_seconds = 45;
+                save_c.b_depth = 3;
+                save_c.output_path = "persisted.mp4";
+                check(save_user_defaults(save_c, tmp_u).has_value(), "save_user_defaults with crop/replay/dev");
+                auto loaded = load_user_defaults(tmp_u);
+                std::filesystem::remove(tmp_u);
+                check(loaded.has_value() && loaded->has_value(), "load_user_defaults succeeds");
+                check((*loaded)->device_index == 2 && (*loaded)->device_explicit, "non-zero device_index sets device_explicit");
+                check((*loaded)->crop.valid() && (*loaded)->crop.width == 1280 && (*loaded)->crop.x == 100, "crop persisted");
+                check((*loaded)->replay_seconds == 45, "replay_seconds persisted");
+                check((*loaded)->b_depth == 3 && (*loaded)->b_depth_explicit, "b_depth persisted");
             }
         }
     }
@@ -822,6 +870,73 @@ void test_instant_replay_and_crop() {
         snap_ms, rstats.buffered_sec, static_cast<double>(rstats.buffered_bytes) / (1024.0 * 1024.0));
 }
 
+void test_fp16_bt2020_and_bframes() {
+    const std::string out_path = "/tmp/vkcap_test_fp16_bt2020_b2.mkv";
+    std::filesystem::remove(out_path);
+
+    Config cfg;
+    cfg.output_path = out_path;
+    cfg.fps = 60;
+    cfg.pixfmt = PixelFormat::P010;
+    cfg.color_space = ColorSpace::Bt2020;
+    cfg.b_depth = 2;
+    cfg.capture_cursor = true;
+
+    auto vk = *VulkanCompute::create(cfg, false);
+    check(vk->configure_output(1280, 720).has_value(), "fp16 configure_output");
+    auto enc = *VideoEncoder::open(cfg, 1280, 720, vk->hw_device_ref(), vk->hw_frames_ref(), false);
+
+    auto db = *vk->create_test_dmabuf(1280, 720, 0, false, true);
+    auto cur = *vk->create_test_dmabuf(64, 64, 0, true, false);
+    for (uint32_t i = 0; i < 30; ++i) {
+        KmsFrame kf{};
+        kf.primary.inode_key = db.inode_key;
+        kf.primary.drm_fourcc = DRM_FORMAT_ABGR16161616F;
+        kf.primary.width = 1280;
+        kf.primary.height = 720;
+        kf.primary.drm_modifier = db.modifier;
+        kf.primary.has_modifier = true;
+        kf.primary.num_planes = 1;
+        kf.primary.planes[0].fd = ::dup(db.fd);
+        kf.primary.planes[0].stride = db.stride;
+        kf.primary.planes[0].size = db.stride * 720;
+
+        kf.cursor.visible = true;
+        kf.cursor.x = static_cast<int32_t>(50 + i * 2);
+        kf.cursor.y = 50;
+        kf.cursor.width = 64;
+        kf.cursor.height = 64;
+        kf.cursor.surface.inode_key = cur.inode_key;
+        kf.cursor.surface.drm_fourcc = DRM_FORMAT_ARGB8888;
+        kf.cursor.surface.width = 64;
+        kf.cursor.surface.height = 64;
+        kf.cursor.surface.drm_modifier = cur.modifier;
+        kf.cursor.surface.has_modifier = true;
+        kf.cursor.surface.owns_fds = false;  // Exercise borrowed cursor FD path
+        kf.cursor.surface.num_planes = 1;
+        kf.cursor.surface.planes[0].fd = cur.fd;
+        kf.cursor.surface.planes[0].stride = cur.stride;
+        kf.cursor.surface.planes[0].size = cur.stride * 64;
+
+        auto fres = vk->process_frame(kf);
+        check(fres.has_value(), "fp16 process_frame");
+        AVFrame *avf = *fres;
+        check(enc->encode_frame(avf, static_cast<int64_t>(i)).has_value(), "fp16 b2 encode_frame");
+        av_frame_free(&avf);
+    }
+    check(enc->finish().has_value(), "fp16 b2 finish");
+    vk->destroy_test_dmabuf(db);
+    vk->destroy_test_dmabuf(cur);
+
+    verify_av1_container(out_path, 1280, 720, 30, false);
+    std::filesystem::remove(out_path);
+    auto cst = vk->stats();
+    double comp_ms = (static_cast<double>(cst.total_compute_ns) / static_cast<double>(cst.frames_processed)) / 1e6;
+    std::cout << std::format(
+        "[PASS] fp16_scrgb_bt2020_bdepth2 (1280x720 P010 + borrowed hwcur): 30 frames, compute {:.3f} ms/f\n",
+        comp_ms);
+}
+
 }  // namespace
 
 int main() {
@@ -829,7 +944,9 @@ int main() {
     test_kms_gpu_pipeline(PixelFormat::Nv12, 1920, 1080, 1920, 1080, 60, "mp4", true, true, true);
     test_kms_gpu_pipeline(PixelFormat::P010, 1920, 1080, 1920, 1080, 60, "mkv", true, false, true);
     test_kms_gpu_pipeline(PixelFormat::Nv12, 3840, 2160, 2560, 1440, 60, "webm", true);
+    test_kms_gpu_pipeline(PixelFormat::Nv12, 3840, 2160, 1920, 1080, 60, "mkv", true);
     test_kms_gpu_pipeline(PixelFormat::Nv12, 3840, 2160, 3840, 2160, 180, "mkv", false);
+    test_fp16_bt2020_and_bframes();
     test_instant_replay_and_crop();
     std::cout << "All KMS unit and GPU integration tests passed.\n";
     return 0;

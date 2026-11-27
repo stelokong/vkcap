@@ -31,7 +31,7 @@ Or start recording immediately from the command line:
 ./build/vkcap -o ~/Videos/clip.mkv
 ```
 
-Press **`Ctrl+C`** (or send `SIGTERM` / close the terminal via `SIGHUP`) to cleanly flush both video and audio encoders and finalize the container (including MP4 `+faststart`).
+Press **`q`** or **`Ctrl+C`** (or send `SIGTERM` / close the terminal via `SIGHUP`) to cleanly flush both video and audio encoders and finalize the container. Live `.mp4` recordings use crash-safe fragmented MP4 (`+frag_keyframe+empty_moov+default_base_moof`) for instant finalization, while saved Instant Replay `.mp4` clips use `+faststart`. Press **`p`** in the terminal (or send `SIGUSR1`) at any time to pause/resume.
 
 ---
 
@@ -91,19 +91,19 @@ Running `./build/vkcap` with **no arguments** in a terminal (or explicitly with 
 ### Adaptive Profiles (`-p, --profile <name>`)
 Profiles are **hardware- and display-aware** rather than fixed constants. Run `./build/vkcap --list-profiles` to see the exact values tailored for your GPU and primary monitor:
 
-- **GPU capabilities (purely probed, zero vendor hardcoding)**: Queries Vulkan Video extensions (`AV1 → HEVC → H.264`), actual 10-bit `P010` hardware encode support, supported rate-control modes (`VBR` / `CQP` / `CBR` with automatic fallback if a driver lacks VBR), `maxQualityLevels`, and `maxBitrate` ceiling. Bitrates automatically adjust for codec efficiency (`AV1 1.0×`, `HEVC 1.20×`, `H.264 1.55×`), and CQP values map to each codec's native scale (`AV1 0..255` vs `HEVC/H.264 0..51`).
+- **GPU capabilities (purely probed, zero vendor hardcoding)**: Queries Vulkan Video extensions (`AV1 → HEVC → H.264`), actual 10-bit `P010` hardware encode support, B-frame reference capabilities (automatically enabling `b_depth=2` on quality-oriented profiles when supported), supported rate-control modes (`VBR` / `CQP` / `CBR` with automatic fallback if a driver lacks VBR), `maxQualityLevels` (scaling quality proportionally per profile), and `maxBitrate` ceiling. Bitrates automatically adjust for codec efficiency (`AV1 1.0×`, `HEVC 1.20×`, `H.264 1.55×`), and CQP values map to each codec's native scale (`AV1 0..255` vs `HEVC/H.264 0..51`).
 - **Resolution & fractional refresh-rate awareness**: Scales VBR target/max bitrates smoothly with output resolution (`(pixels / 1440p)^0.75`) and FPS (`(fps / 60)^0.75`), normalizes fractional monitor rates (`59.94` / `59.998 Hz` → `60 fps`, `74.97 Hz` → `75 fps`, `119.88 Hz` → `120 fps`), steps standard profiles down on sub-60 Hz panels (e.g. `29.97`/`30 Hz` → `30 fps`, `50 Hz` → `50 fps`), and scales 4-second GOP lengths proportionally to the chosen FPS.
 
-Reference values at **1440p @ ≥120 Hz on an AV1 GPU** (explicit CLI flags always override):
+Reference values at **1440p @ ≥120 Hz on a 4-level AV1 GPU with B-frames (e.g. AMD RDNA 4 / VCN 5)** (explicit CLI flags always override):
 
 | Profile | Intended Use | Reference Parameters (1440p AV1) |
 | :--- | :--- | :--- |
-| `default` | Near-native quality, bounded bitrate (recommended default) | 60 fps, AV1, 8-bit NV12 + IGN dither, **VBR 20M (max 32M)**, `quality=1`, `hq` |
+| `default` | Near-native quality, bounded bitrate (recommended default) | 60 fps, AV1, 8-bit NV12 + IGN dither, **VBR 20M (max 32M)**, `B-depth 2`, `quality=2`, `hq` |
 | `gameplay` | High-framerate gameplay | 120 fps, AV1, 8-bit NV12 + IGN dither, **VBR 35M (max 55M)**, `quality=1`, `hq` |
 | `gameplay-10bit` | 10-bit high-framerate gameplay (zero banding) | 120 fps, AV1, 10-bit P010, **VBR 40M (max 60M)**, `quality=1`, `hq` |
-| `master` | Archival / editing master (uncapped CQP) | 60 fps, AV1, 10-bit P010, **CQP 36** (`18` HEVC/H.264), `quality=1`, `hq` |
-| `compact` | Small files for Discord / sharing / long sessions | 60 fps, AV1, 8-bit NV12 + IGN dither, **VBR 8M (max 12M)**, 4s GOP, `hq` |
-| `desktop` | Crisp UI, text, and tutorials at low bitrate | 60 fps, AV1, 8-bit NV12 + IGN dither, **CQP 62** (`26` HEVC/H.264), 4s GOP, `content=desktop` |
+| `master` | Archival / editing master (uncapped CQP) | 60 fps, AV1, 10-bit P010, **CQP 36** (`18` HEVC/H.264), `B-depth 2`, `quality=3`, `hq` |
+| `compact` | Small files for Discord / sharing / long sessions | 60 fps, AV1, 8-bit NV12 + IGN dither, **VBR 8M (max 12M)**, 4s GOP, `B-depth 2`, `quality=2`, `hq` |
+| `desktop` | Crisp UI, text, and tutorials at low bitrate | 60 fps, AV1, 8-bit NV12 + IGN dither, **CQP 62** (`26` HEVC/H.264), 4s GOP, `B-depth 2`, `content=desktop` |
 | `low-latency` | Minimum GPU/encoder footprint for max game FPS | 60 fps, AV1, 8-bit NV12 + IGN dither, **VBR 18M (max 28M)**, `quality=0`, `ll`, `async_depth=2` |
 
 ### Common CLI Examples
@@ -135,10 +135,10 @@ Reference values at **1440p @ ≥120 Hz on an AV1 GPU** (explicit CLI flags alwa
 ./build/vkcap --instant-replay
 ./build/vkcap --instant-replay 60 -p gameplay -o ~/Videos/replays/clip.mp4
 
-# Keybind controls while running:
-#   pkill -USR1 vkcap   -> Pause / Resume recording (continuous A/V timestamps)
-#   pkill -USR2 vkcap   -> Save Instant Replay clip (zero-stutter background write)
-#   pkill -INT  vkcap   -> Stop & finalize cleanly (second Ctrl+C force-exits)
+# Live controls while running (TTY keypresses or signals):
+#   'p' or `pkill -USR1 vkcap`  -> Pause / Resume recording (continuous A/V timestamps, zero audio dropout)
+#   's'/Enter or `pkill -USR2`  -> Save Instant Replay clip (zero-stutter background write)
+#   'q' or Ctrl+C / `pkill -INT`-> Stop & finalize cleanly (second Ctrl+C force-exits)
 
 # Video-only 10-bit master recording without hardware cursor
 ./build/vkcap -D DP-1 -p master --no-sound --no-cursor -o ~/Videos/archive.mkv
@@ -147,9 +147,9 @@ Reference values at **1440p @ ≥120 Hz on an AV1 GPU** (explicit CLI flags alwa
 ./build/vkcap -D DP-1 --input-gamut srgb -o ~/Videos/clip.mkv
 ```
 
-While recording, `vkcap` prints a live single-line status bar with elapsed time, framerate, frame count, drops, bitrate, file size, and GPU compute time:
+While recording, `vkcap` prints a live single-line status bar with elapsed time, framerate, frame count, drops, bitrate, file size, and hardware GPU compute time (`vkCmdWriteTimestamp2`):
 ```text
-[vkcap] 01:23 | 60.0 fps | 4980 frames | 0 dropped | 18.40 Mbps (182.4 MiB) | compute 0.45 ms/f
+[vkcap] 01:23 | 60.0 fps | 4980 frames | 0 dropped | 18.40 Mbps (182.4 MiB) | compute 0.08 ms/f
 ```
 
 ---
@@ -165,7 +165,7 @@ While recording, `vkcap` prints a live single-line status bar with elapsed time,
 | `-D, --display <name\|idx>` | `auto` | Select display by connector (e.g. `DP-1`, `HDMI-A-1`) or list index |
 | `-o, --output <path>` | `vkcap_<ts>.mkv` | Output file (`.mkv`, `.mp4`, `.webm`, `.ivf`); expands `~/` and creates parent dirs |
 | `-f, --fps <n>` | `60` | Locked CFR capture framerate (`1..1000`) |
-| `-s, --scale <WxH\|preset>` | native | GPU Catmull-Rom bicubic scaling (even `WxH`, or `720p`, `1080p`, `1440p`, `4k`) |
+| `-s, --scale <WxH\|preset>` | native | Linear-light GPU scaling: Catmull-Rom bicubic (≤1.55×) / 4-tap area (>1.55×); even `WxH` or `720p`/`1080p`/`1440p`/`4k` |
 | `--crop <WxH+X+Y>` | full display | Zero-copy GPU crop region in display pixels (e.g. `1920x1080+320+180`) |
 | `-d, --duration <sec>` | unlimited | Stop recording automatically after `<sec>` seconds |
 | `--instant-replay [sec]` | off (`30` if flag set) | Rolling instant-replay buffer (`5..600`s) in RAM (inherits `~/.config/vkcap/defaults.conf`); save via `'s'`/`Enter` or `SIGUSR2` |
@@ -184,13 +184,13 @@ While recording, `vkcap` prints a live single-line status bar with elapsed time,
 | `--qp <n>` | `52` (AV1) / `22` | CQP quantizer (`0..255` for AV1, `0..51` for HEVC/H.264); selects CQP when `--rc=auto` |
 | `-b, --bitrate <rate>` | `20M` | Target bitrate (e.g. `20M`, `35M`); selects VBR when `--rc=auto` |
 | `--max-bitrate <rate>` | `32M` / `1.5× bitrate` | Max bitrate ceiling for VBR mode |
-| `--quality <0..16>` | auto (`1`, clamped) | Encoder quality level (clamped to the GPU's `maxQualityLevels`) |
+| `--quality <0..16>` | auto (scaled) | Encoder quality level (auto-scaled to GPU's `maxQualityLevels` per profile) |
 | `--tune <mode>` | `hq` | `default`, `hq`, `ll`, `ull`, `lossless` |
 | `--usage <mode>` | `record` | `default`, `transcode`, `stream`, `record`, `conference` |
 | `--content <mode>` | `rendered` | `default`, `camera`, `desktop`, `rendered` |
 | `--idr-interval <n>` | `fps * 2` | Keyframe interval in frames (2-second GOP default) |
 | `--async-depth <1..64>` | `4` | Vulkan Video encode pipeline depth |
-| `--b-depth <1..8>` | `1` | Max B-frame reference depth |
+| `--b-depth <1..8>` | auto (`2` / `1`) | Max B-frame reference depth (auto `2` on quality profiles when GPU supports B-frames) |
 | `--device <index>` | auto-matched | Vulkan physical device index (auto-matches KMS card on multi-GPU systems) |
 | `--input-gamut <g>` | `auto` | Input framebuffer gamut: `auto`, `edid`, `srgb`, `p3`, `bt2020` |
 | `--color-range <r>` | `limited` | `limited` (`tv`) or `full` (`pc`) |
@@ -211,7 +211,7 @@ While recording, `vkcap` prints a live single-line status bar with elapsed time,
 - **Per-application audio capture / separate audio tracks**: Captures all desktop audio via the PipeWire sink monitor and mixes it with the optional microphone into a single stereo track.
 - **Live network streaming (RTMP / SRT / WHIP)**: Local file recording and instant replay only (`.mkv`, `.mp4`, `.webm`, `.ivf`).
 - **Portrait / rotated display un-rotation**: Captures scanout planes in native orientation (`rotation` plane property is not yet applied).
-- **HDR10 PQ / HLG tone-mapping or HDR static metadata passthrough**: Color management targets SDR output (`BT.709` or `BT.2020`), including automatic EDID wide-gamut inversion for SDR content on wide-gamut Wayland displays.
+- **HDR10 PQ / HLG tone-mapping or HDR static metadata passthrough**: Color management targets SDR output (`BT.709` or `BT.2020` with matching Rec.2020 OETF), including linear FP16 scRGB (`ABGR16161616F`) scanout support and automatic EDID wide-gamut inversion for SDR content on wide-gamut Wayland displays.
 - **CPU software video encoding fallback**: Requires a GPU with Vulkan Video encode support (`AV1`, `HEVC`, or `H.264`).
 - **Legacy PulseAudio/ALSA-only audio capture**: Audio capture uses native PipeWire (`libpipewire-0.3`). Video-only recording (`--no-sound`) works without PipeWire running.
 
@@ -224,35 +224,37 @@ While recording, `vkcap` prints a live single-line status bar with elapsed time,
   │                        ZERO-COPY VIDEO PATH                             │
   │                                                                         │
   │  DRM/KMS Primary Plane (FB2) ─┐                                         │
-  │  DRM/KMS Cursor Plane  (FB2) ─┼─▶ [vkcap] Direct stack ioctls (nice -5) │
-  │  (cursor cache + dedup skip)  │   Rational vblank pacer + TIMER_ABSTIME │
-  │                               │       │                                 │
-  │                               │       ▼ DMA-BUF fd (12-entry MRU cache) │
-  │                               │   Isolated Low-Priority Vulkan Compute  │
-  │                               │   Device (compute_dev, async CmdSlots)  │
-  │                               │   rgb_to_yuv.comp (16×4, subgroupUp,    │
-  │                               │   hw cursor, EDID gamut, IGN dither)    │
-  │                               │       │                                 │
-  │                               │       ▼ OPAQUE_FD alias → AVVkFrame     │
-  │                               │   EncodeFrameQueue (async fence handoff │
-  │                               │   + zero-compute av_frame_clone reuse)  │
-  │                               │       │                                 │
-  │                               │       ▼                                 │
-  │                               │   [vkcap-enc] wait_slot → Vulkan Video  │
-  │                               │   (av1_vulkan / hevc_vulkan / h264)     │
-  │                               └───────┼─────────────────────┐           │
-  └───────────────────────────────────────┼─────────────────────┼───────────┘
-                                          │                     │
-  ┌───────────────────────────────────────┼─────────────────────┼───────────┐
-  │                  ZERO-DRIFT LOW-LATENCY AUDIO PATH          │           │
-  │                                                             │           │
-  │  PipeWire Sink Monitor (F32) ─▶ Lock-free SPSC + PI Cubic ─┐│           │
-  │  PipeWire Selected Mic (F32) ─▶ Lock-free SPSC + PI Cubic ─┼┤           │
-  │  [vkcap-audio-pw RT thread]     (42.7ms cushion, 2-pole LP)││           │
-  │                                                            ▼▼           │
+  │  (SRC_X/Y/W/H multi-mon crop) ├─▶ [vkcap] Direct stack ioctls           │
+  │  DRM/KMS Cursor Plane  (FB2) ─┘   Rational vblank pacer + TIMER_ABSTIME │
+  │  (borrowed cursor FD + dedup)     │                                     │
+  │                                   ▼ DMA-BUF fd (12-entry MRU + _SRGB)   │
+  │                               Isolated Low-Priority Vulkan Compute      │
+  │                               Device (compute_dev, async CmdSlots, TS)  │
+  │                               rgb_to_yuv.comp (16×4, FP16 NV12, linear  │
+  │                               scaling, subgroupUp AVCHROMA_LOC_LEFT,    │
+  │                               hw cursor, EDID gamut / FP16 scRGB, IGN)  │
+  │                                   │                                     │
+  │                                   ▼ OPAQUE_FD alias → AVVkFrame         │
+  │                               EncodeFrameQueue (async fence handoff +   │
+  │                               zero-compute av_frame_clone CFR reuse)    │
+  │                                   │                                     │
+  │                                   ▼                                     │
+  │                               [vkcap-enc] wait_slot → Vulkan Video      │
+  │                               (av1_vulkan / hevc_vulkan / h264, B-ref)  │
+  └───────────────────────────────────┼─────────────────────┐               │
+                                      │                     │               │
+  ┌───────────────────────────────────┴─────────────────────┼───────────────┐
+  │                  ZERO-DRIFT LOW-LATENCY AUDIO PATH      │               │
+  │                                                         │               │
+  │  PipeWire Sink Monitor (F32) ─▶ Lock-free SPSC + PI Cubic ─┐            │
+  │  PipeWire Selected Mic (F32) ─▶ Lock-free SPSC + PI Cubic ─┼┐           │
+  │  [vkcap-audio-pw RT thread]     (42.7ms cushion, 2-pole LP, ││           │
+  │  (param_changed mono/5.1 fold)   zero-dropout pause resume) ││           │
+  │                                                             ▼▼           │
   │  [vkcap-aenc] Wall-clock 20ms tick (same base_ns)     [vkcap-mux]       │
   │  Gain (sys/mic %) + soft-limit → Opus/AAC/FLAC ───▶ Recycled AVPacket   │
   │                                                     Ring → libavformat  │
+  │                                                     (fMP4 / MKV / WebM) │
   └─────────────────────────────────────────────────────────────────────────┘
 ```
 

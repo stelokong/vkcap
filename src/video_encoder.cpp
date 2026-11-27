@@ -1,5 +1,7 @@
 #include "video_encoder.hpp"
+#include "types.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -9,10 +11,12 @@
 #include <filesystem>
 #include <format>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <pthread.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 #include <vulkan/vulkan.h>
 
@@ -82,6 +86,7 @@ struct VkEncodeCaps {
     bool has_av1 = false;
     bool has_hevc = false;
     bool has_h264 = false;
+    bool supports_b_frames = false;
     uint32_t max_quality_levels = 2;  // Conservative fallback if query unavailable
 };
 
@@ -159,8 +164,25 @@ VkEncodeCaps probe_vk_encode_caps(AVBufferRef *hw_device_ref, Codec codec, Pixel
     VkVideoCapabilitiesKHR vcaps{};
     vcaps.sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR;
     vcaps.pNext = &enc_caps;
-    if (pfn_get_caps(vkctx->phys_dev, &prof, &vcaps) == VK_SUCCESS && enc_caps.maxQualityLevels > 0) {
-        caps.max_quality_levels = enc_caps.maxQualityLevels;
+    if (pfn_get_caps(vkctx->phys_dev, &prof, &vcaps) == VK_SUCCESS) {
+        if (enc_caps.maxQualityLevels > 0) {
+            caps.max_quality_levels = enc_caps.maxQualityLevels;
+        }
+        switch (codec) {
+            case Codec::Av1:
+                caps.supports_b_frames = (av1_caps.maxBidirectionalCompoundReferenceCount > 0 &&
+                                          av1_caps.maxBidirectionalCompoundGroup1ReferenceCount > 0 &&
+                                          av1_caps.maxBidirectionalCompoundGroup2ReferenceCount > 0);
+                break;
+            case Codec::Hevc:
+                caps.supports_b_frames = (h265_caps.maxBPictureL0ReferenceCount > 0 &&
+                                          h265_caps.maxL1ReferenceCount > 0);
+                break;
+            case Codec::H264:
+                caps.supports_b_frames = (h264_caps.maxBPictureL0ReferenceCount > 0 &&
+                                          h264_caps.maxL1ReferenceCount > 0);
+                break;
+        }
     }
     return caps;
 }
@@ -191,6 +213,9 @@ struct VideoEncoder::Impl {
     std::mutex replay_mtx;
     std::deque<AVPacket *> replay_v_pkts;
     std::deque<AVPacket *> replay_a_pkts;
+    std::deque<std::pair<uint64_t, int64_t>> replay_kf_seqs;  // (video_seq, pts) for O(1) keyframe eviction
+    uint64_t replay_v_head_seq = 0;
+    uint64_t replay_v_next_seq = 0;
     uint64_t replay_bytes = 0;
     std::atomic<uint64_t> replay_clips_saved{0};
     uint32_t replay_save_seq = 0;
@@ -352,11 +377,13 @@ struct VideoEncoder::Impl {
 
                 if (res) {
                     replay_clips_saved.fetch_add(1, std::memory_order_relaxed);
+                    std::lock_guard log_lk(stderr_mutex());
                     std::cerr << std::format(
                         "\n[vkcap] Saved replay '{}' ({:.1f}s, {:.2f} MiB)\n",
                         saved_path, dur, static_cast<double>(*res) / (1024.0 * 1024.0))
                               << std::flush;
                 } else {
+                    std::lock_guard log_lk(stderr_mutex());
                     std::cerr << std::format("\n[vkcap] Replay save failed: {}\n", res.error())
                               << std::flush;
                 }
@@ -383,26 +410,33 @@ struct VideoEncoder::Impl {
         for (AVPacket *p : replay_a_pkts) av_packet_free(&p);
         replay_v_pkts.clear();
         replay_a_pkts.clear();
+        replay_kf_seqs.clear();
+        replay_v_head_seq = 0;
+        replay_v_next_seq = 0;
         replay_bytes = 0;
     }
 
     void push_replay_packet_locked(AVPacket *p, bool is_video) {
         if (is_video) {
+            const uint64_t seq = replay_v_next_seq++;
             replay_v_pkts.push_back(p);
+            if ((p->flags & AV_PKT_FLAG_KEY) != 0) {
+                replay_kf_seqs.emplace_back(seq, p->pts);
+            }
             replay_bytes += static_cast<uint64_t>(p->size);
             const int64_t window_ticks = static_cast<int64_t>(cfg.replay_seconds) *
                                          static_cast<int64_t>(std::max<uint32_t>(1u, cfg.fps));
             const int64_t newest = p->pts;
             const int64_t cutoff = newest - window_ticks;
-            // Find the latest keyframe at or before cutoff so the buffer always starts on a keyframe
-            // covering at least replay_seconds.
-            size_t drop_until = 0;
-            for (size_t i = 1; i < replay_v_pkts.size(); ++i) {
-                if ((replay_v_pkts[i]->flags & AV_PKT_FLAG_KEY) != 0 &&
-                    replay_v_pkts[i]->pts <= cutoff) {
-                    drop_until = i;
-                }
+            // O(1) amortized eviction: advance keyframe index deque to latest keyframe <= cutoff
+            // so the ring always starts on a keyframe covering at least replay_seconds.
+            while (replay_kf_seqs.size() >= 2 && replay_kf_seqs[1].second <= cutoff) {
+                replay_kf_seqs.pop_front();
             }
+            const size_t drop_until = (!replay_kf_seqs.empty() && replay_kf_seqs.front().first > replay_v_head_seq)
+                ? std::min(replay_v_pkts.size(),
+                           static_cast<size_t>(replay_kf_seqs.front().first - replay_v_head_seq))
+                : 0;
             for (size_t i = 0; i < drop_until; ++i) {
                 AVPacket *old = replay_v_pkts.front();
                 replay_v_pkts.pop_front();
@@ -411,6 +445,7 @@ struct VideoEncoder::Impl {
                 if (free_pkts.size() < 32) free_pkts.push_back(old);
                 else av_packet_free(&old);
             }
+            replay_v_head_seq += drop_until;
             if (audio_enc_ctx && !replay_v_pkts.empty()) {
                 const int64_t a_keep = av_rescale_q(replay_v_pkts.front()->pts,
                                                     enc_ctx->time_base, audio_enc_ctx->time_base) - 24000;
@@ -726,7 +761,10 @@ std::expected<std::unique_ptr<VideoEncoder>, std::string> VideoEncoder::open(
         : static_cast<int>(std::max<uint32_t>(1u, cfg.fps) * 2u);
     const int eff_qp = (cfg.qp >= 0) ? cfg.qp : (chosen_codec == Codec::Av1 ? 52 : 22);
     const int max_q = static_cast<int>(std::max<uint32_t>(1u, vcaps.max_quality_levels)) - 1;
-    const int eff_quality = (cfg.quality >= 0) ? std::min(cfg.quality, max_q) : std::min(1, max_q);
+    const int auto_q = (max_q <= 1) ? max_q : std::max(1, (max_q + 1) / 2);
+    const int eff_quality = (cfg.quality >= 0) ? std::min(cfg.quality, max_q) : auto_q;
+    const int eff_b_depth = (!cfg.b_depth_explicit && vcaps.probed && !vcaps.supports_b_frames)
+        ? 1 : std::max(1, cfg.b_depth);
 
     impl->enc_ctx->width = static_cast<int>(width);
     impl->enc_ctx->height = static_cast<int>(height);
@@ -735,7 +773,7 @@ std::expected<std::unique_ptr<VideoEncoder>, std::string> VideoEncoder::open(
     impl->enc_ctx->sample_aspect_ratio = AVRational{1, 1};
     impl->enc_ctx->pix_fmt = AV_PIX_FMT_VULKAN;
     impl->enc_ctx->gop_size = eff_idr;
-    impl->enc_ctx->max_b_frames = std::max(0, cfg.b_depth - 1);
+    impl->enc_ctx->max_b_frames = std::max(0, eff_b_depth - 1);
 
     impl->enc_ctx->color_range = (cfg.color_range == ColorRange::Full) ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
     impl->enc_ctx->colorspace = (cfg.color_space == ColorSpace::Bt2020) ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709;
@@ -767,13 +805,16 @@ std::expected<std::unique_ptr<VideoEncoder>, std::string> VideoEncoder::open(
             av_dict_set(&opts, "rc_mode", "cbr", 0);
             impl->enc_ctx->bit_rate = cfg.bitrate > 0 ? cfg.bitrate : 20'000'000;
             impl->enc_ctx->rc_max_rate = impl->enc_ctx->bit_rate;
-            impl->enc_ctx->rc_buffer_size = static_cast<int>(impl->enc_ctx->bit_rate);
+            impl->enc_ctx->rc_buffer_size = static_cast<int>(
+                std::min<int64_t>(impl->enc_ctx->bit_rate, std::numeric_limits<int>::max()));
             break;
         case RateControl::Vbr:
             av_dict_set(&opts, "rc_mode", "vbr", 0);
             impl->enc_ctx->bit_rate = cfg.bitrate > 0 ? cfg.bitrate : 20'000'000;
             impl->enc_ctx->rc_max_rate = cfg.max_bitrate > 0 ? cfg.max_bitrate : (impl->enc_ctx->bit_rate * 3) / 2;
-            impl->enc_ctx->rc_buffer_size = static_cast<int>(impl->enc_ctx->rc_max_rate);
+            // 2-second VBV buffer gives local recording rate control headroom during high-motion bursts
+            impl->enc_ctx->rc_buffer_size = static_cast<int>(
+                std::min<int64_t>(impl->enc_ctx->rc_max_rate * 2LL, std::numeric_limits<int>::max()));
             break;
         case RateControl::Auto:
             break;
@@ -785,7 +826,7 @@ std::expected<std::unique_ptr<VideoEncoder>, std::string> VideoEncoder::open(
     av_dict_set(&opts, "content", content_str(cfg.content), 0);
     av_dict_set_int(&opts, "idr_interval", eff_idr, 0);
     av_dict_set_int(&opts, "async_depth", cfg.async_depth, 0);
-    av_dict_set_int(&opts, "b_depth", cfg.b_depth, 0);
+    av_dict_set_int(&opts, "b_depth", eff_b_depth, 0);
 
     err = avcodec_open2(impl->enc_ctx, codec, &opts);
     av_dict_free(&opts);
@@ -917,7 +958,9 @@ std::expected<std::unique_ptr<VideoEncoder>, std::string> VideoEncoder::open(
 
     AVDictionary *mux_opts = nullptr;
     if (impl->fmt_ctx->oformat->name && std::strstr(impl->fmt_ctx->oformat->name, "mp4") != nullptr) {
-        av_dict_set(&mux_opts, "movflags", "+faststart", 0);
+        // Fragmented MP4: crash-safe on every keyframe (2s GOP) and instant 0 ms stop on Ctrl+C
+        // instead of rewriting multi-GB files via +faststart.
+        av_dict_set(&mux_opts, "movflags", "+frag_keyframe+empty_moov+default_base_moof", 0);
     }
     err = avformat_write_header(impl->fmt_ctx, &mux_opts);
     av_dict_free(&mux_opts);

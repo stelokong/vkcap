@@ -199,8 +199,17 @@ std::expected<std::optional<Config>, std::string> load_user_defaults(const std::
             else cfg.content = Content::Rendered;
         } else if (k == "idr_interval") parse_num(v, cfg.idr_interval);
         else if (k == "async_depth") parse_num(v, cfg.async_depth);
-        else if (k == "b_depth") parse_num(v, cfg.b_depth);
-        else if (k == "device_index") parse_num(v, cfg.device_index);
+        else if (k == "b_depth") {
+            if (parse_num(v, cfg.b_depth)) cfg.b_depth_explicit = true;
+        } else if (k == "device_index") {
+            if (parse_num(v, cfg.device_index) && cfg.device_index != 0) {
+                cfg.device_explicit = true;
+            }
+        } else if (k == "crop") {
+            if (!v.empty()) {
+                if (auto cr = parse_crop(v)) cfg.crop = *cr;
+            }
+        } else if (k == "replay_seconds") parse_num(v, cfg.replay_seconds);
         else if (k == "color_range") cfg.color_range = (v == "full") ? ColorRange::Full : ColorRange::Limited;
         else if (k == "color_space") cfg.color_space = (v == "bt2020") ? ColorSpace::Bt2020 : ColorSpace::Bt709;
         else if (k == "input_gamut") {
@@ -271,6 +280,12 @@ std::expected<void, std::string> save_user_defaults(const Config &cfg, const std
     out << "async_depth=" << cfg.async_depth << '\n';
     out << "b_depth=" << cfg.b_depth << '\n';
     out << "device_index=" << cfg.device_index << '\n';
+    if (cfg.crop.valid()) {
+        out << "crop=" << cfg.crop.width << 'x' << cfg.crop.height << '+' << cfg.crop.x << '+' << cfg.crop.y << '\n';
+    }
+    if (cfg.replay_seconds > 0) {
+        out << "replay_seconds=" << cfg.replay_seconds << '\n';
+    }
     out << "color_range=" << crange_to_str(cfg.color_range) << '\n';
     out << "color_space=" << cspace_to_str(cfg.color_space) << '\n';
     out << "input_gamut=" << gamut_to_str(cfg.input_gamut) << '\n';
@@ -307,9 +322,16 @@ std::string format_config_summary(const Config &cfg) {
         rc_str = std::format("CBR {:.1f}M", static_cast<double>(cfg.bitrate > 0 ? cfg.bitrate : 20'000'000) / 1e6);
     }
 
-    ss << std::format("  Display : {} | {} @ {} fps | cursor={}\n",
+    const std::string crop_desc = cfg.crop.valid()
+        ? std::format(" | crop={}x{}+{}+{}", cfg.crop.width, cfg.crop.height, cfg.crop.x, cfg.crop.y)
+        : "";
+    const std::string replay_desc = (cfg.replay_seconds > 0)
+        ? std::format(" | replay={}s", cfg.replay_seconds)
+        : "";
+    ss << std::format("  Display : {} | {} @ {} fps | cursor={}{}{}\n",
                       cfg.display.empty() ? "auto" : cfg.display,
-                      res_str, cfg.fps, cfg.capture_cursor ? "on" : "off");
+                      res_str, cfg.fps, cfg.capture_cursor ? "on" : "off",
+                      crop_desc, replay_desc);
     ss << std::format("  Video   : {} ({}) | {} | quality={} | tune={} | content={}\n",
                       codec_to_str(cfg.codec), pixfmt_to_str(cfg.pixfmt), rc_str,
                       cfg.quality >= 0 ? cfg.quality : 1,

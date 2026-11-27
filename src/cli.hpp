@@ -84,6 +84,7 @@ struct Config {
     bool bitrate_explicit = false;
     bool max_bitrate_explicit = false;
     bool quality_explicit = false;
+    bool b_depth_explicit = false;
     bool from_saved_defaults = false;
 };
 
@@ -97,6 +98,7 @@ struct CodecEncodeCaps {
     uint32_t max_coded_width = 0;
     uint32_t max_coded_height = 0;
     uint64_t max_hw_bitrate = 0;
+    bool supports_b_frames = false;
 };
 
 struct ProfileTarget {

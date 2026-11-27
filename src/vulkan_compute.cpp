@@ -1,5 +1,6 @@
 #include "vulkan_compute.hpp"
 
+#include "rgb_to_yuv_nv12_fp16_spv.hpp"
 #include "rgb_to_yuv_nv12_spv.hpp"
 #include "rgb_to_yuv_p010_spv.hpp"
 
@@ -30,7 +31,9 @@ namespace {
 struct DrmFormatMapping {
     uint32_t drm_fourcc;
     VkFormat vk_format;
+    VkFormat srgb_format;
     VkComponentMapping swizzle;
+    bool is_linear_fp16;
 };
 
 constexpr VkComponentMapping kSwizzleIdentity = {
@@ -42,16 +45,16 @@ constexpr VkComponentMapping kSwizzleOpaqueAlpha = {
     VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_ONE};
 
 constexpr std::array<DrmFormatMapping, 10> kFormatMap = {{
-    {DRM_FORMAT_XRGB8888,      VK_FORMAT_B8G8R8A8_UNORM,           kSwizzleOpaqueAlpha},
-    {DRM_FORMAT_ARGB8888,      VK_FORMAT_B8G8R8A8_UNORM,           kSwizzleIdentity},
-    {DRM_FORMAT_XBGR8888,      VK_FORMAT_R8G8B8A8_UNORM,           kSwizzleOpaqueAlpha},
-    {DRM_FORMAT_ABGR8888,      VK_FORMAT_R8G8B8A8_UNORM,           kSwizzleIdentity},
-    {DRM_FORMAT_XRGB2101010,   VK_FORMAT_A2R10G10B10_UNORM_PACK32, kSwizzleOpaqueAlpha},
-    {DRM_FORMAT_ARGB2101010,   VK_FORMAT_A2R10G10B10_UNORM_PACK32, kSwizzleIdentity},
-    {DRM_FORMAT_XBGR2101010,   VK_FORMAT_A2B10G10R10_UNORM_PACK32, kSwizzleOpaqueAlpha},
-    {DRM_FORMAT_ABGR2101010,   VK_FORMAT_A2B10G10R10_UNORM_PACK32, kSwizzleIdentity},
-    {DRM_FORMAT_ABGR16161616F, VK_FORMAT_R16G16B16A16_SFLOAT,      kSwizzleIdentity},
-    {DRM_FORMAT_XBGR16161616F, VK_FORMAT_R16G16B16A16_SFLOAT,      kSwizzleOpaqueAlpha},
+    {DRM_FORMAT_XRGB8888,      VK_FORMAT_B8G8R8A8_UNORM,           VK_FORMAT_B8G8R8A8_SRGB, kSwizzleOpaqueAlpha, false},
+    {DRM_FORMAT_ARGB8888,      VK_FORMAT_B8G8R8A8_UNORM,           VK_FORMAT_B8G8R8A8_SRGB, kSwizzleIdentity,    false},
+    {DRM_FORMAT_XBGR8888,      VK_FORMAT_R8G8B8A8_UNORM,           VK_FORMAT_R8G8B8A8_SRGB, kSwizzleOpaqueAlpha, false},
+    {DRM_FORMAT_ABGR8888,      VK_FORMAT_R8G8B8A8_UNORM,           VK_FORMAT_R8G8B8A8_SRGB, kSwizzleIdentity,    false},
+    {DRM_FORMAT_XRGB2101010,   VK_FORMAT_A2R10G10B10_UNORM_PACK32, VK_FORMAT_UNDEFINED,     kSwizzleOpaqueAlpha, false},
+    {DRM_FORMAT_ARGB2101010,   VK_FORMAT_A2R10G10B10_UNORM_PACK32, VK_FORMAT_UNDEFINED,     kSwizzleIdentity,    false},
+    {DRM_FORMAT_XBGR2101010,   VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_UNDEFINED,     kSwizzleOpaqueAlpha, false},
+    {DRM_FORMAT_ABGR2101010,   VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_UNDEFINED,     kSwizzleIdentity,    false},
+    {DRM_FORMAT_ABGR16161616F, VK_FORMAT_R16G16B16A16_SFLOAT,      VK_FORMAT_UNDEFINED,     kSwizzleIdentity,    true},
+    {DRM_FORMAT_XBGR16161616F, VK_FORMAT_R16G16B16A16_SFLOAT,      VK_FORMAT_UNDEFINED,     kSwizzleOpaqueAlpha, true},
 }};
 
 const DrmFormatMapping *find_drm_format(uint32_t fourcc) {
@@ -77,6 +80,8 @@ struct PushConstants {
 struct SrcBinding {
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
+    VkImageView srgb_view = VK_NULL_HANDLE;
+    bool is_linear_fp16 = false;
 };
 
 struct CachedSrcImage {
@@ -86,6 +91,8 @@ struct CachedSrcImage {
     std::array<VkDeviceMemory, 4> mem{};
     uint32_t num_mems = 0;
     VkImageView view = VK_NULL_HANDLE;
+    VkImageView srgb_view = VK_NULL_HANDLE;
+    bool is_linear_fp16 = false;
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t drm_fourcc = 0;
@@ -100,7 +107,6 @@ struct CachedDstAlias {
     uint32_t num_mems = 0;
     VkImageView y_view = VK_NULL_HANDLE;
     VkImageView uv_view = VK_NULL_HANDLE;
-    bool initialized_layout = false;
 };
 
 struct CmdSlot {
@@ -110,6 +116,7 @@ struct CmdSlot {
     VkSemaphore ext_wait_sem = VK_NULL_HANDLE;
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     VkDescriptorSet desc_set = VK_NULL_HANDLE;
+    VkQueryPool ts_pool = VK_NULL_HANDLE;
     std::atomic<bool> in_use{false};
     std::chrono::steady_clock::time_point submit_t0{};
 };
@@ -235,7 +242,8 @@ GpuEncodeSupport probe_gpu_encode_support(uint32_t device_index,
                         if (!dst.supported) return;
                         auto query_profile = [&](VkVideoComponentBitDepthFlagBitsKHR bd,
                                                  VkVideoCapabilitiesKHR &vcaps,
-                                                 VkVideoEncodeCapabilitiesKHR &enc_c) -> bool {
+                                                 VkVideoEncodeCapabilitiesKHR &enc_c,
+                                                 bool *out_supports_b = nullptr) -> bool {
                             VkVideoProfileInfoKHR prof{};
                             prof.sType = VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR;
                             prof.chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR;
@@ -280,18 +288,40 @@ GpuEncodeSupport probe_gpu_encode_support(uint32_t device_index,
                             vcaps = {};
                             vcaps.sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR;
                             vcaps.pNext = &enc_c;
-                            return pfn_get_caps(phys, &prof, &vcaps) == VK_SUCCESS;
+                            if (pfn_get_caps(phys, &prof, &vcaps) != VK_SUCCESS) {
+                                return false;
+                            }
+                            if (out_supports_b) {
+                                switch (codec) {
+                                    case Codec::Av1:
+                                        *out_supports_b = (av1_c.maxBidirectionalCompoundReferenceCount > 0 &&
+                                                           av1_c.maxBidirectionalCompoundGroup1ReferenceCount > 0 &&
+                                                           av1_c.maxBidirectionalCompoundGroup2ReferenceCount > 0);
+                                        break;
+                                    case Codec::Hevc:
+                                        *out_supports_b = (h265_c.maxBPictureL0ReferenceCount > 0 &&
+                                                           h265_c.maxL1ReferenceCount > 0);
+                                        break;
+                                    case Codec::H264:
+                                        *out_supports_b = (h264_c.maxBPictureL0ReferenceCount > 0 &&
+                                                           h264_c.maxL1ReferenceCount > 0);
+                                        break;
+                                }
+                            }
+                            return true;
                         };
 
                         VkVideoCapabilitiesKHR vcaps8{};
                         VkVideoEncodeCapabilitiesKHR enc_c8{};
-                        if (query_profile(VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR, vcaps8, enc_c8)) {
+                        bool supports_b = false;
+                        if (query_profile(VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR, vcaps8, enc_c8, &supports_b)) {
                             if (enc_c8.maxQualityLevels > 0) {
                                 dst.max_quality_levels = enc_c8.maxQualityLevels;
                             }
                             dst.max_coded_width = vcaps8.maxCodedExtent.width;
                             dst.max_coded_height = vcaps8.maxCodedExtent.height;
                             dst.max_hw_bitrate = enc_c8.maxBitrate;
+                            dst.supports_b_frames = supports_b;
                             if (enc_c8.rateControlModes != 0) {
                                 dst.supports_vbr = (enc_c8.rateControlModes & VK_VIDEO_ENCODE_RATE_CONTROL_MODE_VBR_BIT_KHR) != 0;
                                 dst.supports_cbr = (enc_c8.rateControlModes & VK_VIDEO_ENCODE_RATE_CONTROL_MODE_CBR_BIT_KHR) != 0;
@@ -341,6 +371,7 @@ struct VulkanCompute::Impl {
     PFN_vkGetPhysicalDeviceMemoryProperties pfn_get_mem_props = nullptr;
     PFN_vkGetPhysicalDeviceProperties2 pfn_get_phys_props2 = nullptr;
     PFN_vkGetPhysicalDeviceFeatures2 pfn_get_phys_feats2 = nullptr;
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties pfn_get_qf_props = nullptr;
     PFN_vkGetMemoryFdKHR pfn_ff_get_mem_fd = nullptr;
     PFN_vkGetSemaphoreCounterValue pfn_ff_get_sem_val = nullptr;
     PFN_vkWaitSemaphores pfn_ff_wait_sems = nullptr;
@@ -401,18 +432,27 @@ struct VulkanCompute::Impl {
     PFN_vkMapMemory pfn_map_mem = nullptr;
     PFN_vkUnmapMemory pfn_unmap_mem = nullptr;
     PFN_vkGetImageDrmFormatModifierPropertiesEXT pfn_get_img_drm_mod = nullptr;
+    PFN_vkCreateQueryPool pfn_create_query_pool = nullptr;
+    PFN_vkDestroyQueryPool pfn_destroy_query_pool = nullptr;
+    PFN_vkCmdResetQueryPool pfn_cmd_reset_query_pool = nullptr;
+    PFN_vkCmdWriteTimestamp2 pfn_cmd_write_ts2 = nullptr;
+    PFN_vkGetQueryPoolResults pfn_get_query_results = nullptr;
 
     bool compute_has_video_enc_ext = false;
     bool compute_has_video_maint1 = false;
     bool use_push_descriptors = false;
+    bool use_fp16 = false;
+    bool use_gpu_timestamps = false;
+    double timestamp_period_ns = 0.0;
+    uint64_t timestamp_mask = UINT64_MAX;
 
     VkSampler linear_sampler = VK_NULL_HANDLE;
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     VkPipelineLayout pipe_layout = VK_NULL_HANDLE;
     VkShaderModule shader_mod = VK_NULL_HANDLE;
     VkPipelineCache pipe_cache = VK_NULL_HANDLE;
-    // Lazily compiled specialized pipelines: [exact1To1 ? 1 : 0][hasCursor ? 1 : 0]
-    VkPipeline pipes[2][2]{};
+    // Specialized pipelines: [exact1To1 ? 1 : 0][hasCursor ? 1 : 0][srcLinear ? 1 : 0]
+    VkPipeline pipes[2][2][2]{};
 
     // 1x1 transparent dummy cursor image so binding 1 is always valid
     CachedSrcImage dummy_cursor{};
@@ -455,6 +495,7 @@ struct VulkanCompute::Impl {
     }
 
     void destroy_src_image(CachedSrcImage &s) {
+        if (s.srgb_view) pfn_destroy_img_view(compute_dev, s.srgb_view, nullptr);
         if (s.view) pfn_destroy_img_view(compute_dev, s.view, nullptr);
         if (s.image) pfn_destroy_image(compute_dev, s.image, nullptr);
         for (uint32_t i = 0; i < s.num_mems; ++i) {
@@ -496,6 +537,7 @@ struct VulkanCompute::Impl {
         destroy_src_image(dummy_cursor);
 
         for (auto &sl : slots) {
+            if (sl.ts_pool && pfn_destroy_query_pool) pfn_destroy_query_pool(compute_dev, sl.ts_pool, nullptr);
             if (sl.ext_wait_sem) pfn_destroy_sem(compute_dev, sl.ext_wait_sem, nullptr);
             if (sl.fence) pfn_destroy_fence(compute_dev, sl.fence, nullptr);
             if (sl.desc_pool) pfn_destroy_dp(compute_dev, sl.desc_pool, nullptr);
@@ -503,7 +545,9 @@ struct VulkanCompute::Impl {
         }
         for (int i = 0; i < 2; ++i) {
             for (int j = 0; j < 2; ++j) {
-                if (pipes[i][j]) pfn_destroy_pipe(compute_dev, pipes[i][j], nullptr);
+                for (int k = 0; k < 2; ++k) {
+                    if (pipes[i][j][k]) pfn_destroy_pipe(compute_dev, pipes[i][j][k], nullptr);
+                }
             }
         }
         if (pipe_cache) pfn_destroy_pipe_cache(compute_dev, pipe_cache, nullptr);
@@ -591,6 +635,7 @@ struct VulkanCompute::Impl {
         pfn_get_mem_props = load_inst<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties");
         pfn_get_phys_props2 = load_inst<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2");
         pfn_get_phys_feats2 = load_inst<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2");
+        pfn_get_qf_props = load_inst<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
 
         if (pfn_get_phys_props2) {
             VkPhysicalDeviceSubgroupProperties sg_props{};
@@ -599,6 +644,7 @@ struct VulkanCompute::Impl {
             p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
             p2.pNext = &sg_props;
             pfn_get_phys_props2(vkctx->phys_dev, &p2);
+            timestamp_period_ns = static_cast<double>(p2.properties.limits.timestampPeriod);
             if ((sg_props.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT) == 0) {
                 return std::unexpected("GPU does not support Vulkan subgroupShuffleUp (VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT)");
             }
@@ -701,6 +747,22 @@ struct VulkanCompute::Impl {
         f12.pNext = &f13;
         f12.timelineSemaphore = VK_TRUE;
 
+        // Enable packed FP16 color ALU for 8-bit NV12 when both shaderFloat16 and
+        // shaderSubgroupExtendedTypes are supported by the GPU (2x FP16 FMA & lower VGPRs).
+        if (cfg.pixfmt != PixelFormat::P010 && pfn_get_phys_feats2) {
+            VkPhysicalDeviceVulkan12Features q12{};
+            q12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+            VkPhysicalDeviceFeatures2 feats2{};
+            feats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            feats2.pNext = &q12;
+            pfn_get_phys_feats2(vkctx->phys_dev, &feats2);
+            if (q12.shaderFloat16 == VK_TRUE && q12.shaderSubgroupExtendedTypes == VK_TRUE) {
+                f12.shaderFloat16 = VK_TRUE;
+                f12.shaderSubgroupExtendedTypes = VK_TRUE;
+                use_fp16 = true;
+            }
+        }
+
         VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_feat{};
         ycbcr_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
         ycbcr_feat.pNext = &f12;
@@ -781,6 +843,27 @@ struct VulkanCompute::Impl {
         pfn_map_mem = load_dev<PFN_vkMapMemory>("vkMapMemory");
         pfn_unmap_mem = load_dev<PFN_vkUnmapMemory>("vkUnmapMemory");
         pfn_get_img_drm_mod = load_dev<PFN_vkGetImageDrmFormatModifierPropertiesEXT>("vkGetImageDrmFormatModifierPropertiesEXT");
+        pfn_create_query_pool = load_dev<PFN_vkCreateQueryPool>("vkCreateQueryPool");
+        pfn_destroy_query_pool = load_dev<PFN_vkDestroyQueryPool>("vkDestroyQueryPool");
+        pfn_cmd_reset_query_pool = load_dev<PFN_vkCmdResetQueryPool>("vkCmdResetQueryPool");
+        pfn_cmd_write_ts2 = load_dev<PFN_vkCmdWriteTimestamp2>("vkCmdWriteTimestamp2");
+        pfn_get_query_results = load_dev<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults");
+
+        if (pfn_get_qf_props && timestamp_period_ns > 0.0 &&
+            pfn_create_query_pool && pfn_destroy_query_pool &&
+            pfn_cmd_reset_query_pool && pfn_cmd_write_ts2 && pfn_get_query_results) {
+            uint32_t qf_cnt = 0;
+            pfn_get_qf_props(vkctx->phys_dev, &qf_cnt, nullptr);
+            if (compute_qf_idx < qf_cnt) {
+                std::vector<VkQueueFamilyProperties> qf_props(qf_cnt);
+                pfn_get_qf_props(vkctx->phys_dev, &qf_cnt, qf_props.data());
+                const uint32_t valid_bits = qf_props[compute_qf_idx].timestampValidBits;
+                if (valid_bits > 0) {
+                    use_gpu_timestamps = true;
+                    timestamp_mask = (valid_bits >= 64u) ? UINT64_MAX : ((uint64_t{1} << valid_bits) - 1u);
+                }
+            }
+        }
 
         pfn_get_dev_queue(compute_dev, compute_qf_idx, 0, &compute_queue);
 
@@ -826,8 +909,12 @@ struct VulkanCompute::Impl {
         // Keep shader module + pipeline cache so specialized pipelines are compiled lazily
         // (typically only 1 variant for --no-cursor or 1-2 variants with cursor, instead of all 4).
         const bool is_p010 = (cfg.pixfmt == PixelFormat::P010);
-        const uint32_t *spv_words = is_p010 ? kRgbToYuvP010Spv.data() : kRgbToYuvNv12Spv.data();
-        const size_t spv_count = is_p010 ? kRgbToYuvP010Spv.size() : kRgbToYuvNv12Spv.size();
+        const uint32_t *spv_words = is_p010
+            ? kRgbToYuvP010Spv.data()
+            : (use_fp16 ? kRgbToYuvNv12Fp16Spv.data() : kRgbToYuvNv12Spv.data());
+        const size_t spv_count = is_p010
+            ? kRgbToYuvP010Spv.size()
+            : (use_fp16 ? kRgbToYuvNv12Fp16Spv.size() : kRgbToYuvNv12Spv.size());
 
         VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0,
                                       spv_count * sizeof(uint32_t), spv_words};
@@ -840,16 +927,23 @@ struct VulkanCompute::Impl {
         src_cache.reserve(kMaxCachedSurfaces);
         dst_alias_cache.reserve(32);
 
-        // Pre-compile the expected 1:1 (or scaled) pipeline variant(s) at startup so frame 0 has zero compile stall
-        const bool likely_1to1 = (cfg.out_width == 0 && cfg.out_height == 0);
-        if (auto p = get_or_create_pipeline(likely_1to1, false); !p) {
-            return std::unexpected(p.error());
-        }
-        if (cfg.capture_cursor) {
-            if (auto p = get_or_create_pipeline(likely_1to1, true); !p) {
+        // Pre-compile both 1:1 and scaled pipeline variants upfront (sharing pipe_cache) so
+        // frame 0 AND mid-recording fullscreen resolution changes have zero compile stalls.
+        const bool likely_1to1_linear = convert_gamut;
+        auto precompile = [&](bool exact_1to1, bool src_lin) -> std::expected<void, std::string> {
+            if (auto p = get_or_create_pipeline(exact_1to1, false, src_lin); !p) {
                 return std::unexpected(p.error());
             }
-        }
+            if (cfg.capture_cursor) {
+                if (auto p = get_or_create_pipeline(exact_1to1, true, src_lin); !p) {
+                    return std::unexpected(p.error());
+                }
+            }
+            return {};
+        };
+        if (auto r = precompile(true, likely_1to1_linear); !r) return r;
+        if (auto r = precompile(false, true); !r) return r;
+        if (auto r = precompile(false, false); !r) return r;
 
         const size_t num_slots = std::max<size_t>(cfg.queue_size + 3, 6);
         slots.clear();
@@ -873,6 +967,16 @@ struct VulkanCompute::Impl {
             if (pfn_create_sem(compute_dev, &semci, nullptr, &sl.ext_wait_sem) != VK_SUCCESS) {
                 return std::unexpected("Failed to create external wait semaphore");
             }
+            if (use_gpu_timestamps) {
+                VkQueryPoolCreateInfo qpci{};
+                qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+                qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                qpci.queryCount = 2;
+                if (pfn_create_query_pool(compute_dev, &qpci, nullptr, &sl.ts_pool) != VK_SUCCESS) {
+                    sl.ts_pool = VK_NULL_HANDLE;
+                    use_gpu_timestamps = false;
+                }
+            }
             if (!use_push_descriptors) {
                 std::array<VkDescriptorPoolSize, 2> psizes = {{
                     {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
@@ -894,8 +998,8 @@ struct VulkanCompute::Impl {
         return init_dummy_cursor();
     }
 
-    std::expected<VkPipeline, std::string> get_or_create_pipeline(bool exact_1to1, bool has_cursor) {
-        VkPipeline &slot = pipes[exact_1to1 ? 1 : 0][has_cursor ? 1 : 0];
+    std::expected<VkPipeline, std::string> get_or_create_pipeline(bool exact_1to1, bool has_cursor, bool src_linear) {
+        VkPipeline &slot = pipes[exact_1to1 ? 1 : 0][has_cursor ? 1 : 0][src_linear ? 1 : 0];
         if (slot != VK_NULL_HANDLE) return slot;
 
         struct SpecData {
@@ -904,8 +1008,10 @@ struct VulkanCompute::Impl {
             VkBool32 enableDither;
             VkBool32 convertGamut;
             float gm[9];
+            VkBool32 srcLinear;
+            VkBool32 dstBt2020Trc;
         };
-        constexpr std::array<VkSpecializationMapEntry, 13> spec_entries = {{
+        constexpr std::array<VkSpecializationMapEntry, 15> spec_entries = {{
             {0,  offsetof(SpecData, exact1To1),    sizeof(VkBool32)},
             {1,  offsetof(SpecData, hasCursor),    sizeof(VkBool32)},
             {2,  offsetof(SpecData, enableDither), sizeof(VkBool32)},
@@ -919,6 +1025,8 @@ struct VulkanCompute::Impl {
             {10, offsetof(SpecData, gm[6]),        sizeof(float)},
             {11, offsetof(SpecData, gm[7]),        sizeof(float)},
             {12, offsetof(SpecData, gm[8]),        sizeof(float)},
+            {13, offsetof(SpecData, srcLinear),    sizeof(VkBool32)},
+            {14, offsetof(SpecData, dstBt2020Trc), sizeof(VkBool32)},
         }};
 
         SpecData sd{};
@@ -927,6 +1035,8 @@ struct VulkanCompute::Impl {
         sd.enableDither = cfg.dither ? VK_TRUE : VK_FALSE;
         sd.convertGamut = convert_gamut ? VK_TRUE : VK_FALSE;
         for (size_t k = 0; k < 9; ++k) sd.gm[k] = gamut_matrix[k];
+        sd.srcLinear = src_linear ? VK_TRUE : VK_FALSE;
+        sd.dstBt2020Trc = (cfg.color_space == ColorSpace::Bt2020) ? VK_TRUE : VK_FALSE;
 
         VkSpecializationInfo sinfo{static_cast<uint32_t>(spec_entries.size()), spec_entries.data(),
                                    sizeof(SpecData), &sd};
@@ -941,6 +1051,31 @@ struct VulkanCompute::Impl {
             return std::unexpected("Failed to create specialized Vulkan RGB->YUV compute pipeline");
         }
         return slot;
+    }
+
+    bool supports_srgb_sampling(VkFormat srgb_fmt, bool has_modifier, uint64_t drm_modifier) const {
+        if (srgb_fmt == VK_FORMAT_UNDEFINED || !pfn_get_fmt_props2) return false;
+        constexpr VkFormatFeatureFlags kReq =
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        if (has_modifier) {
+            VkDrmFormatModifierPropertiesListEXT mod_list{
+                VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT, nullptr, 0, nullptr};
+            VkFormatProperties2 fp2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &mod_list, {}};
+            pfn_get_fmt_props2(vkctx->phys_dev, srgb_fmt, &fp2);
+            if (mod_list.drmFormatModifierCount == 0) return false;
+            std::vector<VkDrmFormatModifierPropertiesEXT> mods(mod_list.drmFormatModifierCount);
+            mod_list.pDrmFormatModifierProperties = mods.data();
+            pfn_get_fmt_props2(vkctx->phys_dev, srgb_fmt, &fp2);
+            for (const auto &m : mods) {
+                if (m.drmFormatModifier == drm_modifier) {
+                    return (m.drmFormatModifierTilingFeatures & kReq) == kReq;
+                }
+            }
+            return false;
+        }
+        VkFormatProperties2 fp2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, nullptr, {}};
+        pfn_get_fmt_props2(vkctx->phys_dev, srgb_fmt, &fp2);
+        return (fp2.formatProperties.linearTilingFeatures & kReq) == kReq;
     }
 
     std::expected<CachedSrcImage, std::string> import_dmabuf(const KmsSurface &surf) {
@@ -975,12 +1110,25 @@ struct VulkanCompute::Impl {
         mod_info.drmFormatModifier = surf.drm_modifier;
         mod_info.drmFormatModifierPlaneCount = num_planes;
         mod_info.pPlaneLayouts = layouts.data();
-        if (surf.has_modifier) ext_img.pNext = &mod_info;
+
+        bool allow_srgb_view = supports_srgb_sampling(fm->srgb_format, surf.has_modifier, surf.drm_modifier);
+        const std::array<VkFormat, 2> view_fmts = {fm->vk_format, fm->srgb_format};
+        VkImageFormatListCreateInfo fmt_list{
+            VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, nullptr,
+            static_cast<uint32_t>(view_fmts.size()), view_fmts.data()};
+
+        if (surf.has_modifier) {
+            ext_img.pNext = &mod_info;
+            if (allow_srgb_view) mod_info.pNext = &fmt_list;
+        } else if (allow_srgb_view) {
+            ext_img.pNext = &fmt_list;
+        }
 
         VkImageCreateInfo ici{};
         ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         ici.pNext = &ext_img;
-        ici.flags = disjoint ? VK_IMAGE_CREATE_DISJOINT_BIT : 0;
+        ici.flags = (disjoint ? static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_DISJOINT_BIT) : VkImageCreateFlags{0}) |
+                    (allow_srgb_view ? static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) : VkImageCreateFlags{0});
         ici.imageType = VK_IMAGE_TYPE_2D;
         ici.format = fm->vk_format;
         ici.extent = {surf.width, surf.height, 1};
@@ -992,6 +1140,7 @@ struct VulkanCompute::Impl {
         ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
         CachedSrcImage out{};
+        out.is_linear_fp16 = fm->is_linear_fp16;
         out.width = surf.width;
         out.height = surf.height;
         out.drm_fourcc = surf.drm_fourcc;
@@ -999,8 +1148,20 @@ struct VulkanCompute::Impl {
         out.has_modifier = surf.has_modifier;
 
         if (pfn_create_image(compute_dev, &ici, nullptr, &out.image) != VK_SUCCESS) {
-            return std::unexpected(std::format("vkCreateImage failed for KMS DMA-BUF {}x{} mod=0x{:x}",
-                                               surf.width, surf.height, surf.drm_modifier));
+            if (allow_srgb_view) {
+                // Retry without mutable _SRGB view if a driver/modifier rejects MUTABLE_FORMAT
+                allow_srgb_view = false;
+                ici.flags = disjoint ? static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_DISJOINT_BIT) : VkImageCreateFlags{0};
+                mod_info.pNext = nullptr;
+                ext_img.pNext = surf.has_modifier ? static_cast<void *>(&mod_info) : nullptr;
+                if (pfn_create_image(compute_dev, &ici, nullptr, &out.image) != VK_SUCCESS) {
+                    return std::unexpected(std::format("vkCreateImage failed for KMS DMA-BUF {}x{} mod=0x{:x}",
+                                                       surf.width, surf.height, surf.drm_modifier));
+                }
+            } else {
+                return std::unexpected(std::format("vkCreateImage failed for KMS DMA-BUF {}x{} mod=0x{:x}",
+                                                   surf.width, surf.height, surf.drm_modifier));
+            }
         }
 
         if (!disjoint) {
@@ -1137,6 +1298,12 @@ struct VulkanCompute::Impl {
             destroy_src_image(out);
             return std::unexpected("vkCreateImageView failed on imported KMS DMA-BUF");
         }
+        if (allow_srgb_view && fm->srgb_format != VK_FORMAT_UNDEFINED) {
+            ivci.format = fm->srgb_format;
+            if (pfn_create_img_view(compute_dev, &ivci, nullptr, &out.srgb_view) != VK_SUCCESS) {
+                out.srgb_view = VK_NULL_HANDLE;
+            }
+        }
         return out;
     }
 
@@ -1162,7 +1329,7 @@ struct VulkanCompute::Impl {
                         for (size_t k = i; k > 0; --k) src_cache[k] = src_cache[k - 1];
                         src_cache[0] = tmp;
                     }
-                    return SrcBinding{src_cache[0].image, src_cache[0].view};
+                    return SrcBinding{src_cache[0].image, src_cache[0].view, src_cache[0].srgb_view, src_cache[0].is_linear_fp16};
                 }
                 destroy_src_image(c);
                 src_cache.erase(src_cache.begin() + static_cast<ptrdiff_t>(i));
@@ -1184,7 +1351,7 @@ struct VulkanCompute::Impl {
         imported->inode_key = surf.inode_key;
         imported->last_used_frame = frame_seq;
         src_cache.insert(src_cache.begin(), *imported);
-        return SrcBinding{src_cache[0].image, src_cache[0].view};
+        return SrcBinding{src_cache[0].image, src_cache[0].view, src_cache[0].srgb_view, src_cache[0].is_linear_fp16};
     }
 
     std::expected<CachedDstAlias *, std::string> get_or_create_dst_alias(const AVVkFrame *vkf) {
@@ -1348,10 +1515,13 @@ std::expected<std::unique_ptr<VulkanCompute>, std::string> VulkanCompute::create
         VkPhysicalDeviceProperties props{};
         auto pfn_get_props = impl->load_inst<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties");
         pfn_get_props(impl->vkctx->phys_dev, &props);
-        std::cerr << std::format("[vulkan] device[{}]='{}' isolated compute_qf={} push_desc={} video_maint1={}\n",
-                                 resolved_dev_idx, props.deviceName, impl->compute_qf_idx,
-                                 impl->use_push_descriptors ? "yes" : "no",
-                                 impl->compute_has_video_maint1 ? "yes" : "no");
+        std::cerr << std::format(
+            "[vulkan] device[{}]='{}' isolated compute_qf={} push_desc={} video_maint1={} fp16={} gpu_ts={}\n",
+            resolved_dev_idx, props.deviceName, impl->compute_qf_idx,
+            impl->use_push_descriptors ? "yes" : "no",
+            impl->compute_has_video_maint1 ? "yes" : "no",
+            impl->use_fp16 ? "yes" : "no",
+            impl->use_gpu_timestamps ? "yes" : "no");
     }
 
     return vc;
@@ -1500,7 +1670,7 @@ std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_
     }
     const SrcBinding src = *src_res;
 
-    SrcBinding cur_img{impl_->dummy_cursor.image, impl_->dummy_cursor.view};
+    SrcBinding cur_img{impl_->dummy_cursor.image, impl_->dummy_cursor.view, VK_NULL_HANDLE, false};
     bool has_cursor = false;
     if (kf.cursor.visible && kf.cursor.surface.num_planes > 0) {
         auto cur_res = impl_->get_or_import_surface(kf.cursor.surface);
@@ -1510,16 +1680,30 @@ std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_
         }
     }
 
-    const float crop_x = kf.crop.valid() ? static_cast<float>(kf.crop.x) : 0.0f;
-    const float crop_y = kf.crop.valid() ? static_cast<float>(kf.crop.y) : 0.0f;
-    const float crop_w = kf.crop.valid() ? static_cast<float>(kf.crop.width) : static_cast<float>(kf.primary.width);
-    const float crop_h = kf.crop.valid() ? static_cast<float>(kf.crop.height) : static_cast<float>(kf.primary.height);
+    const float crop_x = kf.crop.valid() ? static_cast<float>(kf.crop.x)
+                       : (kf.plane_src.valid() ? static_cast<float>(kf.plane_src.x) : 0.0f);
+    const float crop_y = kf.crop.valid() ? static_cast<float>(kf.crop.y)
+                       : (kf.plane_src.valid() ? static_cast<float>(kf.plane_src.y) : 0.0f);
+    const float crop_w = kf.crop.valid() ? static_cast<float>(kf.crop.width)
+                       : (kf.plane_src.valid() ? static_cast<float>(kf.plane_src.width)
+                                               : static_cast<float>(kf.primary.width));
+    const float crop_h = kf.crop.valid() ? static_cast<float>(kf.crop.height)
+                       : (kf.plane_src.valid() ? static_cast<float>(kf.plane_src.height)
+                                               : static_cast<float>(kf.primary.height));
 
     const bool exact_1to1 =
         (static_cast<uint32_t>(crop_w) == impl_->out_width) &&
         (static_cast<uint32_t>(crop_h) == impl_->out_height);
 
-    auto pipe_res = impl_->get_or_create_pipeline(exact_1to1, has_cursor);
+    // Use hardware _SRGB texture view for free exact sRGB->linear decoding whenever
+    // scaling (true linear-light filtering) or gamut-converting 8-bit inputs.
+    const bool want_srgb_view = !src.is_linear_fp16 &&
+                                src.srgb_view != VK_NULL_HANDLE &&
+                                (!exact_1to1 || impl_->convert_gamut);
+    const bool src_linear = src.is_linear_fp16 || want_srgb_view;
+    const VkImageView active_src_view = want_srgb_view ? src.srgb_view : src.view;
+
+    auto pipe_res = impl_->get_or_create_pipeline(exact_1to1, has_cursor, src_linear);
     if (!pipe_res) {
         av_frame_free(&dst_frame);
         return std::unexpected(pipe_res.error());
@@ -1536,7 +1720,7 @@ std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_
         }
     }
     while (impl_->slots[slot_idx].in_use.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
+        impl_->slots[slot_idx].in_use.wait(true, std::memory_order_acquire);
     }
     impl_->slot_cursor = (slot_idx + 1) % nslots;
     CmdSlot &sl = impl_->slots[slot_idx];
@@ -1579,7 +1763,7 @@ std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_
         }
     }
 
-    VkDescriptorImageInfo src_di{impl_->linear_sampler, src.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo src_di{impl_->linear_sampler, active_src_view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo cur_di{impl_->linear_sampler, cur_img.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo y_di{VK_NULL_HANDLE, dst_alias->y_view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo uv_di{VK_NULL_HANDLE, dst_alias->uv_view, VK_IMAGE_LAYOUT_GENERAL};
@@ -1620,9 +1804,13 @@ std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_
         b.image = cur_img.image;
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     }
-    if (!dst_alias->initialized_layout) {
+    {
+        // Always discard previous dst contents (shader overwrites 100% of Y and UV pixels):
+        // satisfies queue-family re-entry after EXTERNAL release and allows DCC/CCS fast discard.
         auto &b = pre_barriers[nb_pre++];
         b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        b.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        b.srcAccessMask = 0;
         b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
         b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -1631,7 +1819,6 @@ std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_
         b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.image = dst_alias->image;
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        dst_alias->initialized_layout = true;
     }
 
     VkDependencyInfo dep_pre{VK_STRUCTURE_TYPE_DEPENDENCY_INFO, nullptr, 0, 0, nullptr, 0, nullptr, nb_pre, pre_barriers.data()};
@@ -1671,8 +1858,17 @@ std::expected<VulkanCompute::SubmittedFrame, std::string> VulkanCompute::submit_
     pc.invSrcSize[1] = inv_src_h;
     impl_->pfn_cmd_push(sl.cmd, impl_->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
+    if (impl_->use_gpu_timestamps && sl.ts_pool != VK_NULL_HANDLE) {
+        impl_->pfn_cmd_reset_query_pool(sl.cmd, sl.ts_pool, 0, 2);
+        impl_->pfn_cmd_write_ts2(sl.cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, sl.ts_pool, 0);
+    }
+
     // Workgroup is 16x4 threads, each covering 2x2 luma = 32x8 pixels per workgroup
     impl_->pfn_cmd_dispatch(sl.cmd, (impl_->out_width + 31u) / 32u, (impl_->out_height + 7u) / 8u, 1);
+
+    if (impl_->use_gpu_timestamps && sl.ts_pool != VK_NULL_HANDLE) {
+        impl_->pfn_cmd_write_ts2(sl.cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, sl.ts_pool, 1);
+    }
 
     std::array<VkImageMemoryBarrier2, 3> post_barriers{};
     uint32_t nb_post = 0;
@@ -1749,12 +1945,28 @@ void VulkanCompute::wait_slot(uint32_t slot_idx) noexcept {
     CmdSlot &sl = impl_->slots[slot_idx];
     if (!sl.in_use.load(std::memory_order_acquire)) return;
     impl_->pfn_wait_fences(impl_->compute_dev, 1, &sl.fence, VK_TRUE, UINT64_MAX);
-    const auto t1 = std::chrono::steady_clock::now();
+
+    uint64_t comp_ns = 0;
+    bool got_gpu_ts = false;
+    if (impl_->use_gpu_timestamps && sl.ts_pool != VK_NULL_HANDLE) {
+        uint64_t ts[2]{0, 0};
+        if (impl_->pfn_get_query_results(impl_->compute_dev, sl.ts_pool, 0, 2,
+                                         sizeof(ts), ts, sizeof(uint64_t),
+                                         VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            const uint64_t delta = (ts[1] - ts[0]) & impl_->timestamp_mask;
+            comp_ns = static_cast<uint64_t>(static_cast<double>(delta) * impl_->timestamp_period_ns);
+            got_gpu_ts = true;
+        }
+    }
+    if (!got_gpu_ts) {
+        const auto t1 = std::chrono::steady_clock::now();
+        comp_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - sl.submit_t0).count());
+    }
+
     impl_->stat_frames_processed.fetch_add(1, std::memory_order_relaxed);
-    impl_->stat_total_compute_ns.fetch_add(
-        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - sl.submit_t0).count()),
-        std::memory_order_relaxed);
+    impl_->stat_total_compute_ns.fetch_add(comp_ns, std::memory_order_relaxed);
     sl.in_use.store(false, std::memory_order_release);
+    sl.in_use.notify_one();
 }
 
 std::expected<AVFrame *, std::string> VulkanCompute::process_frame(const KmsFrame &kf) {
@@ -1776,14 +1988,15 @@ ComputeStats VulkanCompute::stats() const noexcept {
 }
 
 std::expected<VulkanCompute::TestDmaBuf, std::string> VulkanCompute::create_test_dmabuf(
-    uint32_t width, uint32_t height, uint32_t frame_idx, bool is_cursor) {
+    uint32_t width, uint32_t height, uint32_t frame_idx, bool is_cursor, bool is_fp16) {
+    const VkFormat test_fmt = is_fp16 ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_B8G8R8A8_UNORM;
     VkDrmFormatModifierPropertiesListEXT mod_list{VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT, nullptr, 0, nullptr};
     VkFormatProperties2 fp2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &mod_list, {}};
-    impl_->pfn_get_fmt_props2(impl_->vkctx->phys_dev, VK_FORMAT_B8G8R8A8_UNORM, &fp2);
+    impl_->pfn_get_fmt_props2(impl_->vkctx->phys_dev, test_fmt, &fp2);
     std::vector<VkDrmFormatModifierPropertiesEXT> mods(mod_list.drmFormatModifierCount);
     if (!mods.empty()) {
         mod_list.pDrmFormatModifierProperties = mods.data();
-        impl_->pfn_get_fmt_props2(impl_->vkctx->phys_dev, VK_FORMAT_B8G8R8A8_UNORM, &fp2);
+        impl_->pfn_get_fmt_props2(impl_->vkctx->phys_dev, test_fmt, &fp2);
     }
     uint64_t mod = DRM_FORMAT_MOD_LINEAR;
     for (const auto &m : mods) {
@@ -1802,7 +2015,7 @@ std::expected<VulkanCompute::TestDmaBuf, std::string> VulkanCompute::create_test
     ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ici.pNext = &ext_img;
     ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = VK_FORMAT_B8G8R8A8_UNORM;
+    ici.format = test_fmt;
     ici.extent = {width, height, 1};
     ici.mipLevels = 1;
     ici.arrayLayers = 1;
@@ -1853,7 +2066,8 @@ std::expected<VulkanCompute::TestDmaBuf, std::string> VulkanCompute::create_test
     pfn_sub_layout(impl_->compute_dev, out.img, &sub, &slayout);
     out.stride = static_cast<uint32_t>(slayout.rowPitch);
 
-    const VkDeviceSize buf_bytes = static_cast<VkDeviceSize>(width) * height * 4;
+    const VkDeviceSize bpp = is_fp16 ? 8u : 4u;
+    const VkDeviceSize buf_bytes = static_cast<VkDeviceSize>(width) * height * bpp;
     VkBuffer st_buf = VK_NULL_HANDLE;
     VkDeviceMemory st_mem = VK_NULL_HANDLE;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, buf_bytes,
@@ -1868,17 +2082,37 @@ std::expected<VulkanCompute::TestDmaBuf, std::string> VulkanCompute::create_test
     impl_->pfn_bind_buf_mem(impl_->compute_dev, st_buf, st_mem, 0);
     impl_->pfn_map_mem(impl_->compute_dev, st_mem, 0, buf_bytes, 0, &mapped);
 
-    auto *px = static_cast<uint32_t *>(mapped);
-    for (uint32_t y = 0; y < height; ++y) {
-        for (uint32_t x = 0; x < width; ++x) {
-            if (is_cursor) {
-                bool arrow = (x < 16 && y < 16 && x <= y);
-                px[static_cast<size_t>(y) * width + x] = arrow ? 0xFFFFFFFFu : 0x00000000u;
-            } else {
-                const uint32_t bar_x = (frame_idx * 37u) % width;
-                uint8_t r = (x >= bar_x && x < bar_x + 64) ? 240u : static_cast<uint8_t>((x * 255u) / width);
-                uint8_t g = static_cast<uint8_t>((y * 255u) / height);
-                px[static_cast<size_t>(y) * width + x] = (0xFFu << 24) | (r << 16) | (g << 8) | 128u;
+    if (is_fp16) {
+        // Fill linear scRGB FP16 pattern: R=0.5 (0x3800), G=0.25 (0x3400), B=0.125 (0x3000), A=1.0 (0x3C00)
+        auto *px16 = static_cast<uint16_t *>(mapped);
+        const uint16_t r_hi = 0x3C00u;  // 1.0 linear
+        const uint16_t r_lo = 0x3400u;  // 0.25 linear
+        const uint16_t g_v = 0x3400u;   // 0.25 linear
+        const uint16_t b_v = 0x3000u;   // 0.125 linear
+        const uint16_t a_v = 0x3C00u;   // 1.0
+        const uint32_t bar_x = (frame_idx * 37u) % width;
+        for (uint32_t y = 0; y < height; ++y) {
+            for (uint32_t x = 0; x < width; ++x) {
+                const size_t idx = (static_cast<size_t>(y) * width + x) * 4;
+                px16[idx + 0] = (x >= bar_x && x < bar_x + 64) ? r_hi : r_lo;
+                px16[idx + 1] = g_v;
+                px16[idx + 2] = b_v;
+                px16[idx + 3] = a_v;
+            }
+        }
+    } else {
+        auto *px = static_cast<uint32_t *>(mapped);
+        for (uint32_t y = 0; y < height; ++y) {
+            for (uint32_t x = 0; x < width; ++x) {
+                if (is_cursor) {
+                    bool arrow = (x < 16 && y < 16 && x <= y);
+                    px[static_cast<size_t>(y) * width + x] = arrow ? 0xFFFFFFFFu : 0x00000000u;
+                } else {
+                    const uint32_t bar_x = (frame_idx * 37u) % width;
+                    uint8_t r = (x >= bar_x && x < bar_x + 64) ? 240u : static_cast<uint8_t>((x * 255u) / width);
+                    uint8_t g = static_cast<uint8_t>((y * 255u) / height);
+                    px[static_cast<size_t>(y) * width + x] = (0xFFu << 24) | (r << 16) | (g << 8) | 128u;
+                }
             }
         }
     }
